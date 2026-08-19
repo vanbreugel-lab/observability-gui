@@ -1662,10 +1662,10 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                 fig_est = gr.Plot(show_label=False)
             with gr.Accordion('Measurements', open=False):
                 fig_meas = gr.Plot(show_label=False)
-            with gr.Accordion('Inputs (measured accelerations)', open=False):
-                gr.Markdown('*Process-model inputs, not measurements: they enter '
-                            'the prediction step, so a bias here walks the '
-                            'estimate away with nothing to pull it back.*')
+            with gr.Accordion('Inputs', open=False):
+                #gr.Markdown('*Process-model inputs, not measurements: they enter '
+                #            'the prediction step, so a bias here walks the '
+                #            'estimate away with nothing to pull it back.*')
                 fig_inputs = gr.Plot(show_label=False)
 
     # -------------------------------- wiring ---------------------------------
