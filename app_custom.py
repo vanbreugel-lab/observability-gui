@@ -1056,8 +1056,8 @@ _SYS_DESC = {
             'velocities, heading & rate, and ambient wind (speed & direction). '
             'Mass, inertia, damping and motor coefficients are fixed '
             'parameters rather than states, which keeps Q genuinely positive '
-            'definite without a jitter floor. The default system.',
-    'fly': 'fly (full state) — the same dynamics with the calibration '
+            'definite without a jitter floor.',
+    'fly': 'fly (full state) — the default. The same dynamics with the calibration '
            'parameters promoted to estimated states (18 in total: the pybounds '
            'example). Mass, inertia, the three damping coefficients and four '
            'motor coefficients are all unknown, so they need a small process-'
@@ -1074,7 +1074,7 @@ _SYS_DESC = {
 SYS_IMG = {'fly': 'fly_system_web.png', 'fly7': 'fly_system_web.png',
            'drone': 'drone_system_web.png', 'alt2d': 'drone_system_2d_web.png'}
 
-SYS_LIST = [('fly7', 'fly (simple)'), ('fly', 'fly (full state)'),
+SYS_LIST = [('fly', 'fly (full state)'), ('fly7', 'fly (simple)'),
             ('drone', 'drone (3D)'), ('alt2d', 'altitude 2D'),
             ]
 
@@ -1093,7 +1093,7 @@ def _system_md(name):
             f"- **inputs**: {', '.join(f'`{u}`' for u in s.input_names)}\n"
             f"- **measurements**: {meas}\n")
 
-_S0 = get_spec('fly7')     # defaults for the initial system, fly (simple)
+_S0 = get_spec('fly')      # defaults for the initial system, fly (full state)
 
 
 def open_tutorial():
@@ -1144,7 +1144,7 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
         with gr.Column(scale=2, min_width=360):
             with gr.Accordion('Choose your system', open=True,
                               elem_id='sec_system') as acc_system:
-                system = gr.Dropdown(SYSTEM_LABELS, value='fly7', label='system')
+                system = gr.Dropdown(SYSTEM_LABELS, value='fly', label='system')
                 sys_file = gr.File(label='upload a system .py (defines f, h, '
                                    'state_names, measurement_names, dt; add '
                                    'position_states + input_bounds for MPC)',
@@ -1220,7 +1220,7 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                                                     label='trajectory-id column (blank = whole file)')
                                 obj_dd = gr.Dropdown([], label='trajectory')
                                 phys_status = gr.Markdown('')
-                            dt_hz = gr.Dropdown(DT_HZ, value=_BASE_HZ['fly7'],
+                            dt_hz = gr.Dropdown(DT_HZ, value=_BASE_HZ['fly'],
                                                 label='sampling rate')
                     with gr.Column(scale=1, min_width=160):
                         with gr.Accordion('External stimuli', open=False,

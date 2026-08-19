@@ -42,8 +42,8 @@ import render
 
 # ─────────────────────────── system metadata ────────────────────────────────
 
-SYSTEM_LABELS = [('fly (simple)', 'fly7'),
-                 ('fly (full state)', 'fly'),
+SYSTEM_LABELS = [('fly (full state)', 'fly'),
+                 ('fly (simple)', 'fly7'),
                  ('drone (kinematic 3D)', 'drone'),
                  ('altitude 2D (paper Fig. 4b)', 'alt2d'),
                  ('Custom system (upload f & h)', 'custom')]
