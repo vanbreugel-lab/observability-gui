@@ -1,0 +1,30 @@
+# Web UI — two front-ends over the same core.py:
+#   app_custom.py     Gradio      (local; has the .py uploader + draw canvas)
+#   streamlit_app.py  Streamlit   (what Streamlit Community Cloud deploys)
+# Installing both is only for running both locally. If you deploy to Streamlit
+# Cloud and want a faster/slimmer build, drop the gradio line — streamlit_app.py
+# never imports it.
+gradio>=6.0
+streamlit>=1.50          # width='stretch' on st.pyplot / st.data_editor
+
+# Draw-a-trajectory canvas for the Streamlit app. Optional: without it that one
+# control hides itself. Do NOT pass background_image= to st_canvas — that path
+# calls streamlit.elements.image.image_to_url, which current Streamlit no longer
+# has. Plain canvases work fine.
+streamlit-drawable-canvas
+
+# Scientific stack (also pulled in by pybounds, pinned here for clarity)
+numpy
+scipy
+pandas
+matplotlib
+
+# MPC trajectory solver — compiled, needs a real server (this is why the app
+# can't run purely client-side in the browser / on GitHub Pages)
+casadi
+do-mpc
+
+# The compute engine's package. Installed straight from the upstream repo so
+# this Space/repo stays self-contained. Pin to a commit/tag for reproducibility
+# once you cut a release.
+pybounds @ git+https://github.com/vanbreugel-lab/pybounds.git

@@ -1,0 +1,40 @@
+# ── python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ── os / editor ──
+.DS_Store
+
+# ── not part of this app ──
+# Other front-ends kept in the working copy but not shipped here.
+app_simple_old.py
+custom_system_app.py
+Dockerfile
+.dockerignore
+alt2d_fig4d_check.py
+developmentnotes.md
+
+# Sample custom-system uploads and, more importantly, the training .hdf files —
+# those are research data, not app code.
+examples_custom/
+
+# Full-resolution source art. The app loads only the downscaled *_web.png
+# copies, and these originals are 1-11 MB each.
+tutorial_imgs/drone_system.png
+tutorial_imgs/drone_system_2d.png
+tutorial_imgs/fly_system.png
+tutorial_imgs/kf_eqs.png
+
+# Same idea for the walkthrough screen recording: the 50 MB source capture stays
+# local, the README links the 4.5 MB muted *_web.mp4 copy.
+tutorial_imgs/tutorial_video.mov
+
+# ── run artifacts ──
+*.log
+output.png
+
+# gradio flag/cache dir
+.gradio/
