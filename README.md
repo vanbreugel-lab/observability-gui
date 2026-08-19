@@ -15,9 +15,9 @@ why this cannot be a static page.
 A one-minute tour of the app — build a trajectory, simulate, read the
 observability panels. No audio.
 
-<video src="https://github.com/vanbreugel-lab/observability-gui/raw/main/tutorial_imgs/tutorial_video_web.mp4" controls muted playsinline width="100%"></video>
+<video src="https://github.com/user-attachments/assets/77dfe85e-c1d3-4567-81ee-04271cd675d9" controls="controls" style="max-width: 730px;"></video>
 
-If the player above does not load, [download the walkthrough](tutorial_imgs/tutorial_video_web.mp4).
+If the player does not load, [download the walkthrough](tutorial_imgs/tutorial_video_web.mp4).
 
 ## Run it locally
 
