@@ -24,6 +24,23 @@ matplotlib
 casadi
 do-mpc
 
+# Second EKF/UKF implementation (engine/dynamax_filters.py), selected by the
+# "EKF / UKF implementation" control in the Estimators section — the same
+# estimation problem run through a third-party filter, as a cross-check on this
+# repo's own. Pulls in JAX, so it is the heaviest line here; the app degrades
+# gracefully without it (the control falls back to the NumPy filters and says
+# so in the status line), which makes this a safe line to drop from a slim
+# Streamlit Cloud build — streamlit_app.py pins the NumPy backend anyway.
+#
+# Installing into an EXISTING env can want to bump numpy/scipy under compiled
+# packages that were built against the old ones; add
+# `numpy==<current> scipy==<current>` to the pip command there to hold them.
+#
+# Note: dynamax depends on tfp-nightly (tensorflow-probability's nightly), so
+# this line makes the build depend on a moving target — pin dynamax and
+# tfp-nightly when you cut a release.
+dynamax
+
 # The compute engine's package. Installed straight from the upstream repo so
 # this Space/repo stays self-contained. Pin to a commit/tag for reproducibility
 # once you cut a release.

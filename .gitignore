@@ -28,9 +28,13 @@ tutorial_imgs/drone_system_2d.png
 tutorial_imgs/fly_system.png
 tutorial_imgs/kf_eqs.png
 
-# Same idea for the walkthrough screen recording: the 50 MB source capture stays
-# local, the README links the 4.5 MB muted *_web.mp4 copy.
+# The walkthrough screen recording. The README embeds it from a GitHub
+# user-attachments URL, so none of these need to be in the repo: the .mov is the
+# 50 MB source capture, the .mp4 the muted 4.5 MB copy that was uploaded, and
+# the .png a poster frame pulled from it.
 tutorial_imgs/tutorial_video.mov
+tutorial_imgs/tutorial_video_web.mp4
+tutorial_imgs/tutorial_video_poster.png
 
 # ── run artifacts ──
 *.log

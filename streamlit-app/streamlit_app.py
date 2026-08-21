@@ -422,6 +422,10 @@ an, ak = d['ann'], d['aikf']
 p = dict(w_raw=int(w), eps=float(eps), lam=float(lam), r_diag=r_diag,
          q_diag=q_diag, q_noise=str(q_noise), sensors=sensors, states=states,
          do_stoch=bool(do_stoch) and bool(bases), bases=bases,
+         # EKF/UKF implementation. The dynamax (JAX) alternative is selectable
+         # in the Gradio app (app_custom.py); this deployed front-end pins the
+         # NumPy filters so the Space doesn't have to ship JAX.
+         backend='engine',
          # ANN / AI-KF are work-in-progress and disabled in both front-ends
          do_ann=False,
          ann_target=an['target'], ann_layers=core._parse_layers(an['layers']),

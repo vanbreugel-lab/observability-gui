@@ -83,13 +83,47 @@ seconds; later launches reuse it.
 | `core.py` | **the shared compute core** — set-point builder, `compute_payload`, figure assembly, per-system defaults. UI-agnostic; imports no toolkit |
 | `app_custom.py` | the Gradio app — layout, controls, callbacks |
 | `render.py` | every matplotlib figure |
+| `tests/` | the unit-test suite (see *Tests* below) |
 | `smoke_test.py` | end-to-end checks, incl. front-end parity (see below) |
 | `engine/observability_gui.py` | the compute engine: MPC, Gramians, EKF/UKF |
 | `engine/stochastic_observability.py` | the stochastic observability & constructability Gramians |
 | `engine/drone_model.py` | the 3D drone dynamics/measurement model |
+| `engine/dynamax_filters.py` | second EKF/UKF implementation, via dynamax (JAX) |
 | `engine/ann_estimator.py` | ANN estimator + AI-KF (see below) |
 | `tutorial_imgs/` | figures for the in-app tutorial and reference sections |
 | `streamlit-app/streamlit_app.py` | Streamlit app — same core, different UI, work in progress as a potential way to permanently deploy online |
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest                  # the whole suite, ~1 minute
+python -m pytest -m "not slow"    # skip the full-trajectory solves, ~40 s
+python smoke_test.py              # the end-to-end script, incl. front-end parity
+```
+
+The suite is organised by what it protects, rather than by module:
+
+| file | what it pins |
+|---|---|
+| `tests/test_tables.py` | the entry parsers — blank rows, stray letters, negative variances, names left over from another system. This is where a user's typing lands, and none of it may raise out of a callback |
+| `tests/test_specs.py` | every built-in system's self-consistency: `f`/`h` return their declared dimensions, and every declared sensor/state actually exists. Nothing checks this at import time |
+| `tests/test_trajectory.py` | set-point precedence, and the drawing canvas given degenerate input (one click, a repeated point, a 400-point scribble, a zero-size canvas) |
+| `tests/test_engine.py` | the invariants the app's *claims* rest on: same seed → identical problem, P stays positive (the ±2σ band), min-EV scales with R and responds to λ, more sensors never loosen the bound, caches invalidate when they must |
+| `tests/test_compute.py` | one refresh end to end, with control values that fight the numerics — a window longer than the trajectory, no sensors selected, λ below the round-off floor, R = 0. Also pins the Gradio wiring against `_compute`'s signature, by position and by name |
+| `tests/test_app_robustness.py` | the upload paths: a system `.py` missing `f`, a syntax error, a CSV without the named columns, a corrupted canvas payload |
+| `tests/test_dynamax_backend.py` | the second filter implementation agrees with the first (skipped when dynamax is not installed) |
+| `tests/test_render_and_export.py` | every figure actually *draws* (matplotlib defers its work to render time), and the PDF export writes a real PDF |
+
+Two conventions worth knowing if you add to it:
+
+* **Callbacks may not raise.** A Gradio callback that throws shows the user a red
+  box with no explanation. At that layer the requirement is a returned status
+  string starting with ⚠ — so the tests are mostly "give it something wrong,
+  assert it comes back with a message".
+* **Engines are expensive and shared.** `conftest.py` solves each system once, on
+  a short hand-made set-point, and hands the same engine to every test. Ask for
+  the `fresh_engine` fixture if your test mutates one.
 
 ## Work in progress
 

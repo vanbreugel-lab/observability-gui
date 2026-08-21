@@ -18,6 +18,8 @@ import io
 import time
 import warnings
 import contextlib
+import functools
+import importlib.util
 
 # do-mpc prints ONNX/opcua "feature not available" UserWarnings on import; they
 # are informational (those optional extras just aren't installed) — hush them.
@@ -65,6 +67,23 @@ CMAPS = ['inferno_r', 'viridis', 'plasma', 'magma', 'cividis', 'copper',
 _BASE_HZ = {name: float(round(1.0 / SYSTEMS[name]().dt)) for name in SYSTEMS}
 
 
+# ── filter backend: this repo's NumPy EKF/UKF, or the same problem run through
+# dynamax (JAX). See engine/dynamax_filters.py for what is shared and what
+# necessarily differs. Availability is probed WITHOUT importing jax (seconds of
+# start-up), so a front-end can label the control before anything is computed.
+FILTER_BACKENDS = [('this repo (NumPy)', 'engine'), ('dynamax (JAX)', 'dynamax')]
+
+
+def _has_module(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+DYNAMAX_AVAILABLE = _has_module('jax') and _has_module('dynamax')
+
+
 def build_setpoint(spec, segments, recorded, v0, wind, zeta):
     """ Build the MPC set-point. custom position set-point → drawn/measured
     (speed, heading) → motif segments → the system's default trajectory. """
@@ -84,24 +103,56 @@ def build_setpoint(spec, segments, recorded, v0, wind, zeta):
 
 # ─────────────── compute (Qt-free, lifted from observability_app) ────────────
 
-def compute_payload(engine, job, p, est):
-    """ All the heavy numerics for one refresh. Copied verbatim from
+# Stage weights for progress reporting, measured on the fly system: MPC and the
+# empirical FIM dominate and both grow with trajectory length, so a bar that
+# treated stages equally would sit at 20% for most of a long run. Rough is fine;
+# these only decide where the bar sits, never what is computed.
+_STAGES = (('mpc', 0.45, 'solving MPC trajectory'),
+           ('emp', 0.30, 'empirical Fisher information'),
+           ('stoch', 0.05, 'stochastic gramians'),
+           ('filt', 0.12, 'running EKF / UKF'),
+           ('ann', 0.08, 'ANN / AI-KF'))
+
+
+def compute_payload(engine, job, p, est, on_stage=None):
+    """ All the heavy numerics for one refresh. Lifted from
     ``observability_app.compute_payload`` — it never touched Qt, only the
-    engine. ``job`` is ('update',) or ('rebuild', setpoint). """
+    engine. ``job`` is ('update',) or ('rebuild', setpoint).
+
+    ``on_stage(fraction, label)`` is an optional progress callback, called before
+    each stage starts. A long drawn trajectory puts tens of seconds into MPC and
+    the empirical FIM, which otherwise looks like the app has hung. """
     spec = engine.spec
     note = ''
+    done = [0.0]
+
+    def tick(key):
+        """ Report the stage about to start, then bank its weight. """
+        for k, wt, label in _STAGES:
+            if k != key:
+                continue
+            if on_stage is not None:
+                try:
+                    on_stage(done[0], label)
+                except Exception:
+                    pass                # progress must never break the compute
+            done[0] += wt
+        return time.time()
+
     if job[0] == 'rebuild':
-        t0 = time.time()
+        t0 = tick('mpc')
         with contextlib.redirect_stdout(io.StringIO()):     # hush IPOPT
             engine.simulate_mpc(job[1])
         note = f'trajectory: {engine.N} steps in {time.time() - t0:.1f} s'
+    else:
+        done[0] += _STAGES[0][1]        # nothing to solve; skip that slice
     if not engine.N:
         return {'error': 'no trajectory'}
 
     w = int(min(p['w_raw'], max(engine.N - 1, 3)))
     # empirical FIM (pybounds, Q=0) — always; stochastic gramian (Eq.33, Q>0) —
     # optional, so the two min-error-variance results can be compared.
-    t0 = time.time()
+    t0 = tick('emp')
     ev_emp, _ = engine.empirical_ev(w, p['eps'], p['r_diag'], p['lam'],
                                     sensors=p['sensors'], states=p['states'])
     t_emp = time.time() - t0
@@ -109,7 +160,7 @@ def compute_payload(engine, job, p, est):
     # (and their trajectory panels) can be drawn together for comparison
     ev_stoch, t_stoch = {}, 0.0
     if p['do_stoch']:
-        t0 = time.time()
+        t0 = tick('stoch')
         for b in p['bases']:
             ev_stoch[b] = engine.linearized_ev(
                 w, p['q_diag'], p['r_diag'], p['lam'],
@@ -117,38 +168,91 @@ def compute_payload(engine, job, p, est):
                 q_noise=p.get('q_noise', 'uncorrelated'))
         t_stoch = time.time() - t0
 
+    # Which implementation runs the filter recursion, resolved before anything
+    # is computed so the note is written even if the filters then fail.
+    # 'dynamax' hands the SAME problem (same seed → same Y, x̂₀, P₀, U; same
+    # sensor subset; same Q convention) to dynamax's JAX filters, so a
+    # disagreement is a disagreement about the filter and nothing else.
+    # Anything dynamax cannot reproduce is listed in the note, not left
+    # implicit. The ANN / AI-KF below always uses the engine's own UKF.
+    # anything unrecognized is the NumPy path: a stale browser session or a
+    # script can post any string here, and reporting back a backend that did
+    # not run would put a wrong line in the exported report
+    backend = 'dynamax' if p.get('backend') == 'dynamax' else 'engine'
+    dmx = None
+    if backend == 'dynamax':
+        try:
+            import dynamax_filters as dmx
+            if not dmx.AVAILABLE:
+                raise dmx.IMPORT_ERROR
+        except Exception as exc:
+            note += (f'{" | " if note else ""}⚠ dynamax backend unavailable '
+                     f'({type(exc).__name__}: {exc}) — ran the NumPy filters '
+                     f'instead; pip install dynamax')
+            backend, dmx = 'engine', None
+    if backend == 'dynamax':
+        caveats = dmx.limitations(spec, p.get('q_noise', 'uncorrelated'))
+        note += (f'{" | " if note else ""}EKF/UKF via dynamax'
+                 + (' — ' + '; '.join(caveats) if caveats else ''))
+
     results, meas = None, None
+    tick('filt')
     try:
         results = {}
-        # both filters use the SAME R and Q as the observability analysis, but
-        # each brings its OWN realization (seed, per-state initial guess,
-        # injected disturbance) — see _realization. The UKF also takes α, β, κ.
+        # both filters use the SAME R, Q and SENSORS as the observability
+        # analysis, but each brings its OWN realization (seed, per-state initial
+        # guess, injected disturbance) — see _realization. The UKF also takes
+        # α, β, κ.
+        #
+        # The sensor set matters as much as R and Q: driving the estimators from
+        # every channel of h() while the Gramians see only p['sensors'] compares
+        # a filter that had extra information against a bound that did not, so
+        # the min-error-variance curve and the estimator's actual error are then
+        # answers to different questions.
         qd, rd = p['q_diag'], p['r_diag']
-        filt_specs = [
-            ('EKF', engine.run_ekf, {}),
-            ('UKF', engine.run_ukf, dict(alpha=est['ukf_alpha'],
-                                         beta=est['ukf_beta'],
-                                         kappa=est['ukf_kappa']))]
+        ukf_kw = dict(alpha=est['ukf_alpha'], beta=est['ukf_beta'],
+                      kappa=est['ukf_kappa'])
+        if backend == 'dynamax':
+            filt_specs = [
+                ('EKF', functools.partial(dmx.run_ekf, engine), {}),
+                ('UKF', functools.partial(dmx.run_ukf, engine), ukf_kw)]
+        else:
+            filt_specs = [
+                ('EKF', engine.run_ekf, {}),
+                ('UKF', engine.run_ukf, ukf_kw)]
         # Each filter is caught on its own: a UKF that goes singular must not
         # take the working EKF (and both estimator plots) down with it.
         for name, fn, extra in filt_specs:
             e = est[name]
-            fkey = (name, engine._version, p.get('q_noise', 'uncorrelated'),
+            # the backend is part of the cache key: the two implementations are
+            # allowed to disagree, so serving one's result for the other would
+            # hide exactly what this option exists to show
+            fkey = (name, backend, engine._version,
+                    p.get('q_noise', 'uncorrelated'),
                     tuple(f'{qd[k]:.3e}' for k in spec.state_names),
                     tuple(f'{rd[m]:.3e}' for m in spec.measurement_names),
-                    e['seed'], round(e['unv'], 9), e['ub'], e['p0'],
+                    e['seed'], round(e['unv'], 9), e['ub'],
+                    None if e['p0'] is None else tuple(np.round(e['p0'], 12)),
                     None if e['x0'] is None else tuple(np.round(e['x0'], 12)),
+                    # the sensor set is part of the problem, so it must key the
+                    # cache too — otherwise changing the selection would serve a
+                    # stale estimate computed from the previous one
+                    tuple(p['sensors']),
                     tuple(sorted(extra.items())))
             try:
                 if fkey not in engine._filt_cache:
                     engine._filt_cache[fkey] = fn(
                         qd, rd, seed=e['seed'], u_noise_var=e['unv'],
                         u_bias=e['ub'], p0_diag=e['p0'],
-                        x0_guess=e['x0'],
+                        x0_guess=e['x0'], sensors=p['sensors'],
                         q_noise=p.get('q_noise', 'uncorrelated'), **extra)
                 results[name] = engine._filt_cache[fkey]
-            except np.linalg.LinAlgError as exc:
-                note += f'{" | " if note else ""}⚠ {name} failed: {exc}'
+            # not just LinAlgError: a third-party backend can fail in its own
+            # ways (an untraceable model, a jax error), and one filter's failure
+            # must still leave the other one plotted
+            except Exception as exc:
+                note += (f'{" | " if note else ""}⚠ {name} failed: '
+                         f'{type(exc).__name__}: {exc}')
         if not results:
             raise np.linalg.LinAlgError('no estimator converged')
         X, U = engine.X, engine.U
@@ -184,7 +288,7 @@ def compute_payload(engine, job, p, est):
     # cached per (spec, state, shape) and survive trajectory edits.
     ann, t_ann = None, 0.0
     if p['do_ann']:
-        t0 = time.time()
+        t0 = tick('ann')
         st = p['ann_target']
         e_u = est['UKF']            # the AI-KF is a UKF: same realization
         try:
@@ -219,8 +323,15 @@ def compute_payload(engine, job, p, est):
             ann = {st: dict(error=f'{type(exc).__name__}: {exc}')}
         t_ann = time.time() - t0
 
+    # say so when the estimators are running on fewer channels than h() offers —
+    # the measurement panel still plots ŷ for EVERY channel, including ones the
+    # filter never saw, and without this the two are easy to confuse
+    if results and len(p['sensors']) < len(spec.measurement_names):
+        note += (f'{" | " if note else ""}EKF/UKF driven by '
+                 f'{", ".join(p["sensors"])} (the observability selection)')
+
     return dict(ev_emp=ev_emp, ev_lin=ev_stoch, bases=p['bases'], results=results,
-                meas=meas, ann=ann, w=w, lam=p['lam'],
+                meas=meas, ann=ann, w=w, lam=p['lam'], backend=backend,
                 q_zeta=p['q_diag'].get('zeta', 0.0),
                 t_emp=t_emp, t_stoch=t_stoch, t_ann=t_ann,
                 floor=engine.lam_noise_floor, note=note)
@@ -374,7 +485,9 @@ def _est_defaults(s):
             inj = dict(channel=ch, mag=float(mag), t0=float(t0), t1=float(t1))
     a, b, k = getattr(s, 'ukf_paper', (1.0, 2.0, 0.0))
     return dict(ann=ann, aikf=aikf, inj=inj,
-                p0=getattr(s, 'p0_paper', None),
+                # per-state P0 table, prefilled with the spec's paper P0 when it
+                # has one and blank otherwise
+                p0=_p0_rows(s),
                 u_noise=float(getattr(s, 'u_noise_default', 0.0) or 0.0),
                 ukf_alpha=float(a), ukf_beta=float(b), ukf_kappa=float(k),
                 # blank initial-guess table: every state starts from the seeded
@@ -393,27 +506,28 @@ def _realization(spec, seed, inj_ch, inj_mag, inj_t0, inj_t1, u_noise, x0_rows,
     measurements, which is a different (and usually less informative)
     comparison.
 
-    P₀ has no control of its own: it follows the initial estimate, widening for
-    any state whose guess you pin far from the truth (see _estimation_problem).
-    A spec may still carry a paper P₀ (alt2d's p0_paper = 10) and that is
-    applied here so the published defaults keep reproducing. """
+    P₀ is a per-state diagonal (`p0` is the table, or a scalar to broadcast).
+    Any state left blank follows the initial estimate, widening if you pin that
+    guess far from the truth (see _estimation_problem), so pinned and
+    guess-following states mix freely. An all-blank table falls back to the
+    spec's paper P₀ (alt2d's p0_paper = 10) so the published defaults keep
+    reproducing. """
     ub = None
     if inj_ch and inj_ch != 'none' and float(inj_mag or 0.0) != 0.0 \
             and float(inj_t1 or 0.0) > float(inj_t0 or 0.0) \
             and inj_ch in spec.input_names:
         ub = (spec.input_names.index(inj_ch), float(inj_mag),
               float(inj_t0), float(inj_t1))
-    # an explicit P0 wins; otherwise fall back to the spec's published default
-    # (alt2d's p0_paper = 10) so the paper figures keep reproducing
-    try:
-        p0 = float(p0) if p0 not in (None, '') else None
-    except (TypeError, ValueError):
-        p0 = None
-    if p0 is None or not p0 > 0:
-        p0 = getattr(spec, 'p0_paper', None)
+    # an explicit P0 entry wins per state; a fully blank table falls back to the
+    # spec's published default (alt2d's p0_paper = 10) so the paper figures keep
+    # reproducing
+    p0v = _p0_vec(p0, spec.state_names)
+    if p0v is None:
+        pp = getattr(spec, 'p0_paper', None)
+        p0v = _p0_vec([[n, pp.get(n)] for n in spec.state_names]
+                      if isinstance(pp, dict) else pp, spec.state_names)
     return dict(seed=int(seed or 0), unv=float(u_noise or 0.0), ub=ub,
-                x0=_x0_vec(x0_rows, spec.state_names),
-                p0=(float(p0) if p0 else None))
+                x0=_x0_vec(x0_rows, spec.state_names), p0=p0v)
 
 
 def _q_rows_default(s):
@@ -437,6 +551,21 @@ def _x0_rows(s):
     return [[n, None] for n in s.state_names]
 
 
+def _p0_rows(s):
+    """ Per-state P₀ table: [[state, variance-or-blank], ...].
+
+    A spec's published P₀ (alt2d's p0_paper = 10) fills every row, so the paper
+    figures keep reproducing what the single broadcast box used to give. Every
+    other system starts blank, meaning each state's P₀ follows its initial
+    guess (see _estimation_problem). """
+    pp = getattr(s, 'p0_paper', None)
+    if isinstance(pp, dict):                        # already per-state
+        return [[n, (float(pp[n]) if pp.get(n) else None)]
+                for n in s.state_names]
+    v = float(pp) if pp else None
+    return [[n, v] for n in s.state_names]
+
+
 def _x0_vec(rows, names):
     """ Initial-guess table -> array aligned to `names`, NaN where the row was
     left blank, or None when the whole table is blank. Values pass through
@@ -456,6 +585,41 @@ def _x0_vec(rows, names):
                               else np.nan)
         except (TypeError, ValueError):
             pass                                    # unparseable -> stays blank
+    return None if not np.any(np.isfinite(v)) else v
+
+
+def _p0_vec(rows, names):
+    """ P₀ table -> array aligned to `names`, NaN where the row was left blank
+    (that state's P₀ then follows its initial guess — see _estimation_problem),
+    or None when the whole table is blank.
+
+    A variance must be > 0 to mean anything, so zero/negative/unparseable
+    entries are treated as blank rather than silently producing a singular P₀.
+
+    A bare scalar is still accepted and broadcasts over every state: that is
+    what the Streamlit front-end's single P₀ box passes, and what the Gradio
+    per-state table replaced. """
+    if rows is None:
+        return None
+    if isinstance(rows, (int, float, str)):         # scalar broadcast
+        try:
+            v = float(rows)
+        except (TypeError, ValueError):
+            return None
+        return np.full(len(names), v) if np.isfinite(v) and v > 0 else None
+    if hasattr(rows, 'values'):                     # DataFrame
+        rows = rows.values.tolist()
+    v = np.full(len(names), np.nan)
+    idx = {n: i for i, n in enumerate(names)}
+    for row in rows or []:
+        if not row or row[0] not in idx:
+            continue
+        try:
+            val = (float(row[1])
+                   if len(row) > 1 and row[1] not in (None, '') else np.nan)
+        except (TypeError, ValueError):
+            continue                                # unparseable -> stays blank
+        v[idx[row[0]]] = val if np.isfinite(val) and val > 0 else np.nan
     return None if not np.any(np.isfinite(v)) else v
 
 
@@ -585,8 +749,14 @@ def canvas_to_recorded(spec, pts_px, W, H, v0, dur):
     points to work with. """
     W, H = (W or 1), (H or 1)
     xr, yr = spec.rec_xlim, spec.rec_ylim
-    raw = np.asarray(pts_px, dtype=float).reshape(-1, 2) if len(pts_px) \
-        else np.empty((0, 2))
+    # The points come from JavaScript, so they are whatever arrived: a ragged
+    # list, strings, or not a sequence at all. Anything unreadable is "no path
+    # drawn yet", which is a message rather than a traceback out of a callback.
+    try:
+        raw = (np.asarray(pts_px, dtype=float).reshape(-1, 2)
+               if len(pts_px) else np.empty((0, 2)))
+    except (ValueError, TypeError):
+        raw = np.empty((0, 2))
     pts = (np.column_stack([xr[0] + raw[:, 0] / W * (xr[1] - xr[0]),
                             yr[1] - raw[:, 1] / H * (yr[1] - yr[0])])
            if len(raw) else np.empty((0, 2)))

@@ -27,6 +27,32 @@ import app_custom as A
 # for real by the on_system check below, which passes every argument positionally.
 print(f'_compute params: {len(inspect.signature(A._compute).parameters)}')
 
+# ── COMPUTE_IN must line up with _compute, slot for slot ──
+# Gradio binds COMPUTE_IN to _compute's parameters BY POSITION, so inserting a
+# control in one place and not the other silently shifts every argument after
+# it — the app then runs with, say, a seed where a checkbox belongs. Both lists
+# use the same names, so compare them: an off-by-one shows up as a name
+# mismatch, not as a mystery. COMPUTE_IN is local to the Blocks context, so
+# read it out of the source with ast rather than importing it.
+import ast
+
+_tree = ast.parse(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    'app_custom.py')).read())
+_ci = next(node.value.elts for node in ast.walk(_tree)
+           if isinstance(node, ast.Assign) and isinstance(node.value, ast.List)
+           and any(isinstance(t, ast.Name) and t.id == 'COMPUTE_IN'
+                   for t in node.targets))
+_ci = [e.id for e in _ci if isinstance(e, ast.Name)]
+_fn = next(n for n in _tree.body
+           if isinstance(n, ast.FunctionDef) and n.name == '_compute')
+# _compute's tail is (rebuild, progress), which are not UI inputs
+_params = [a.arg for a in _fn.args.args][:-2]
+assert len(_ci) == len(_params), (f'COMPUTE_IN has {len(_ci)} entries, '
+                                  f'_compute takes {len(_params)} inputs')
+_drift = [(i, a, b) for i, (a, b) in enumerate(zip(_params, _ci)) if a != b]
+assert not _drift, f'COMPUTE_IN / _compute positional drift: {_drift}'
+print(f'  COMPUTE_IN lines up with _compute: {len(_ci)} inputs, names match')
+
 
 def _labels(fig):
     """ Plotted (non-underscore) line labels in a figure. """
@@ -34,7 +60,8 @@ def _labels(fig):
             if not l.get_label().startswith('_')}
 
 
-def args_for(q_obs, q_con, do_stoch=True, q_noise='uncorrelated'):
+def args_for(q_obs, q_con, do_stoch=True, q_noise='uncorrelated',
+             backend='engine', split=False):
     S = A._S0
     return ({}, None, [], None, 'fly', 100.0, 1.5, 1.0, 0.3, 6, 1e-6, 1e-5,
             'uniform', 0.1, A._r_rows(S), do_stoch, q_obs, q_con,
@@ -47,12 +74,17 @@ def args_for(q_obs, q_con, do_stoch=True, q_noise='uncorrelated'):
             # EKF realization: seed, per-state initial guess, injection. A
             # blank guess row = start that state at the truth plus the seeded
             # random error, which is the default for every state here.
-            0, A._x0_rows(S), 'none', 0.0, 0.0, 0.0, 0.0, None,
+            0, A._x0_rows(S), 'none', 0.0, 0.0, 0.0, 0.0, A._p0_rows(S),
             # UKF realization — same values, so the two filters see identical
-            # data — plus its sigma-point tuning. Trailing None = P0 left blank,
-            # which falls back to the spec default.
-            0, A._x0_rows(S), 'none', 0.0, 0.0, 0.0, 0.0, None,
+            # data — plus its sigma-point tuning. The trailing P0 table is
+            # per-state; blank rows fall back to the spec default.
+            0, A._x0_rows(S), 'none', 0.0, 0.0, 0.0, 0.0, A._p0_rows(S),
             1.0, 2.0, 0.0,
+            # est_split: False = the shared controls drive both filters (the
+            # UKF's own values above are ignored). Then which implementation
+            # runs: 'engine' (this repo, NumPy) or 'dynamax' (JAX) — that path
+            # is exercised separately below, and only when it is installed.
+            split, backend,
 
             'zeta', '64, 64, 64', 4, 4, 40, 256, 0.01,
             S.input_names[-1], 20, 0.5, 1e12, 1e-3,
@@ -183,9 +215,9 @@ else:
     import core
     _real, _grabbed = core.compute_payload, []
 
-    def _spy(engine, job, p, est):
-        out = _real(engine, job, p, est)     # gradio solves the MPC in here,
-        _grabbed.append((p, est))            # so this must run after
+    def _spy(engine, job, p, est, **kw):     # **kw: on_stage, from the Gradio side
+        out = _real(engine, job, p, est, **kw)   # gradio solves the MPC in here,
+        _grabbed.append((p, est))                # so this must run after
         return out
 
     core.compute_payload = A.compute_payload = _spy
@@ -220,5 +252,135 @@ else:
     for _k in ('ukf_alpha', 'ukf_beta', 'ukf_kappa'):
         assert _ge[_k] == _se[_k], (_k, _ge[_k], _se[_k])
     print('  sigma-point tuning identical')
+
+print()
+print('=== per-state P0: one row must move only that state ===')
+print('  the point of the table is that a pinned state and a')
+print('  guess-following state coexist, so check both halves at once.')
+_S = A._S0
+_names = list(_S.state_names)
+_tgt, _other = _names[0], _names[1]
+
+# (a) the table -> vector step: one row filled, the rest blank
+_rows = A._p0_rows(_S)
+for _r in _rows:
+    _r[1] = None                                  # start from a blank table
+_rows[0][1] = 42.0
+_v = C._p0_vec(_rows, _names)
+assert _v is not None and _v[0] == 42.0, _v
+assert np.isnan(_v[1:]).all(), _v
+print(f'  _p0_vec: {_tgt}=42.0, {len(_names) - 1} others blank (NaN)')
+
+# blank table -> None, so the spec's paper P0 still takes over
+assert C._p0_vec([[n, None] for n in _names], _names) is None
+# a scalar still broadcasts (the Streamlit box), and <= 0 is ignored
+assert np.all(C._p0_vec(7.0, _names) == 7.0)
+assert C._p0_vec([[_tgt, 0.0], [_other, -3.0]], _names) is None
+print('  blank -> None (spec P0 wins); scalar broadcasts; <= 0 ignored')
+
+# (b) the vector -> P0 matrix step: only the pinned diagonal entry changes
+_eng = C.ObservabilityEngine(_S)
+with contextlib.redirect_stdout(io.StringIO()):
+    _eng.simulate_mpc(_S.default_setpoint(float(_S.wind_default),
+                                          float(_S.zeta_default)))
+_rd = {m: 0.1 for m in _S.measurement_names}
+_, _, _P_base, _, _ = _eng._estimation_problem(_rd, 0)
+_, _, _P_pin, _, _ = _eng._estimation_problem(_rd, 0, p0_diag=_v)
+assert np.isclose(_P_pin[0, 0], 42.0), _P_pin[0, 0]
+_d_base, _d_pin = np.diag(_P_base), np.diag(_P_pin)
+assert np.allclose(_d_base[1:], _d_pin[1:]), (_d_base, _d_pin)
+print(f'  P0[{_tgt}] = {_d_pin[0]:g} (pinned), '
+      f'{_other} unchanged at {_d_pin[1]:.4g}')
+
+print()
+print('=== dynamax filter backend: the same problem, a second implementation ===')
+if not C.DYNAMAX_AVAILABLE:
+    print('  SKIPPED — dynamax not installed (pip install dynamax)')
+else:
+    import dynamax_filters as dmx
+    assert dmx.AVAILABLE, dmx.IMPORT_ERROR
+    # (a) the whole app path, exactly as the UI drives it
+    with contextlib.redirect_stdout(io.StringIO()):
+        _o = A._compute(*args_for(True, False, backend='dynamax'), rebuild=True)
+    _est_d, _meas_d, _st_d = _o[4], _o[5], str(_o[7])
+    assert isinstance(_est_d, Figure) and isinstance(_meas_d, Figure), _o[:7]
+    _est_d.canvas.draw()
+    assert {'true', 'EKF ±2σ', 'UKF ±2σ'} <= _labels(_est_d), _labels(_est_d)
+    assert 'failed' not in _st_d, _st_d
+    assert 'via dynamax' in _st_d, _st_d
+    print(f'  fly through _compute: {_st_d[:96]}')
+
+    # (b) the numbers. alt2d has no angular measurement channels and linear
+    #     dynamics, so the two EKFs linearize about the same thing and nothing
+    #     is left to excuse a difference: they must agree to near machine
+    #     precision. This is the check that would catch a real divergence.
+    _S = C.get_spec('alt2d')
+    _e = C.ObservabilityEngine(_S)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _e.simulate_mpc(C.build_setpoint(_S, [], None, _S.v0_default,
+                                         _S.wind_default, _S.zeta_default))
+    _qd = {s: 1e-4 for s in _S.state_names}
+    _rd = {m: 0.1 for m in _S.measurement_names}
+    for _nm, _fe, _fd, _kw in (
+            ('EKF', _e.run_ekf, dmx.run_ekf, {}),
+            ('UKF', _e.run_ukf, dmx.run_ukf, dict(alpha=1.0, beta=2.0,
+                                                  kappa=0.0))):
+        _Xe, _Pe = _fe(_qd, _rd, seed=0, **_kw)
+        _Xd, _Pd = _fd(_e, _qd, _rd, seed=0, **_kw)
+        assert np.isfinite(_Xd).all(), (_nm, 'dynamax produced non-finite states')
+        _rel = (np.abs(_Xd - _Xe).max(axis=0)
+                / np.maximum(np.abs(_Xe).max(axis=0), 1e-9)).max()
+        print(f'  alt2d {_nm}: max relative difference {_rel:.2e} '
+              f'(engine vs dynamax)')
+        assert _rel < 1e-5, (_nm, _rel)
+
+    # (c) the callback path — how an untraceable (e.g. scipy-using) uploaded
+    #     model is filtered — must reach the same answer as the jax.numpy one
+    _Xj, _ = dmx.run_ekf(_e, _qd, _rd, seed=0, mode='jax')
+    _Xc, _ = dmx.run_ekf(_e, _qd, _rd, seed=0, mode='callback')
+    _rel = (np.abs(_Xj - _Xc).max(axis=0)
+            / np.maximum(np.abs(_Xj).max(axis=0), 1e-9)).max()
+    print(f'  alt2d EKF: jax vs pure_callback model path {_rel:.2e}')
+    assert _rel < 1e-5, _rel
+
+    # (d) the strong check, on the systems that actually exercise the hard
+    #     parts (18 states, arctan2 measurements). The ONLY thing the two EKFs
+    #     do differently is where they linearize the prediction, so pointing the
+    #     NumPy one at dynamax's choice must collapse the difference to
+    #     round-off. If this ever loosens, the two implementations have genuinely
+    #     diverged — a much sharper instrument than comparing on alt2d.
+    for _sn in ('fly', 'fly7', 'drone'):
+        _sp = C.get_spec(_sn)
+        _en = C.ObservabilityEngine(_sp)
+        with contextlib.redirect_stdout(io.StringIO()):
+            _en.simulate_mpc(C.build_setpoint(_sp, [], None, _sp.v0_default,
+                                              _sp.wind_default,
+                                              _sp.zeta_default))
+        _q = dict(getattr(_sp, 'q_tiny', None)
+                  or {s: 1e-4 for s in _sp.state_names})
+        _r = {m: 0.1 for m in _sp.measurement_names}
+        _sel = tuple(_sp.fim_sensors)
+        _Xd, _ = dmx.run_ekf(_en, _q, _r, seed=0, sensors=_sel)
+        _Xe, _ = _en.run_ekf(_q, _r, seed=0, sensors=_sel, f_jac_at='pre')
+        _rel = (np.abs(_Xd - _Xe).max(axis=0)
+                / np.maximum(np.abs(_Xe).max(axis=0), 1e-9)).max()
+        print(f'  {_sn:6s} EKF (matched linearization point): {_rel:.2e}')
+        assert _rel < 1e-6, (_sn, _rel)
+        # and the angular wrapping must be doing something on the UKF: without
+        # it the drone's course/heading residuals cross the branch cut and the
+        # estimate moves away from the engine's
+        _Xw, _ = dmx.run_ukf(_en, _q, _r, seed=0, sensors=_sel, alpha=1.0,
+                             beta=2.0, kappa=0.0)
+        _Xu, _ = dmx.run_ukf(_en, _q, _r, seed=0, sensors=_sel, alpha=1.0,
+                             beta=2.0, kappa=0.0, wrap_angles=False)
+        _Xk, _ = _en.run_ukf(_q, _r, seed=0, sensors=_sel, alpha=1.0, beta=2.0,
+                             kappa=0.0)
+        _sc = np.maximum(np.abs(_Xk).max(axis=0), 1e-9)
+        _dw = (np.abs(_Xw - _Xk).max(axis=0) / _sc).max()
+        _du = (np.abs(_Xu - _Xk).max(axis=0) / _sc).max()
+        print(f'  {_sn:6s} UKF vs engine: wrapped {_dw:.2e}, '
+              f'unwrapped {_du:.2e}')
+        assert _dw <= _du * 1.001, (_sn, _dw, _du)   # wrapping never hurts
+        assert _dw < 5e-3, (_sn, _dw)
 
 print('\nALL SMOKE CHECKS PASS')

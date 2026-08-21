@@ -13,6 +13,7 @@ import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.collections import PatchCollection
 
@@ -123,6 +124,22 @@ def meas_default(spec):
     picks = tuple(m for m in ('gamma', 'a', 'g')
                   if m in spec.measurement_names)
     return picks or tuple(spec.measurement_names[:3])
+
+
+def _known(selection, names, fallback):
+    """ A caller's channel/state selection, keeping only names this system
+    actually has, in the caller's order; `fallback` when nothing is left.
+
+    Every plotted selection turns into a `names.index(...)` lookup a few lines
+    later, so one stale entry used to raise ValueError mid-draw. The figures are
+    assembled OUTSIDE the app's try/except, so that surfaced as an unexplained
+    error box rather than as a status message — and a stale entry is easy to
+    arrive at, since a selection made for one system outlives the switch to the
+    next (which is why the app wires these controls with .input rather than
+    .change). Dropping the unknown names shows the user the panels that do
+    exist. """
+    known = [n for n in (selection or []) if n in names]
+    return known or list(fallback)
 
 
 def _center_shift(engine, w):
@@ -301,8 +318,10 @@ def render_main(fig, engine, spec, payload, color_state, ev_states,
     pipes = _pipes_of(payload)
     if not pipes:
         return
-    cs = color_state
-    ev_states = ev_states or [spec.color_state_default]
+    cs = color_state if color_state in spec.state_names \
+        else spec.color_state_default
+    ev_states = _known(ev_states, spec.state_names,
+                       [spec.color_state_default])
     qz, w = payload['q_zeta'], payload['w']
     shift = _center_shift(engine, w)     # paper ω/2 centering (Methods step 7)
     norm = mpl.colors.LogNorm(vmin, vmax)
@@ -456,7 +475,8 @@ def render_measurements(fig, engine, spec, meas, meas_sel,
     full state vector of its own: its prediction substitutes the ANN's estimate
     for that one state into the AI-KF's state vector (labelled accordingly). """
     t = engine.t
-    sensors = (meas_sel or list(meas_default(spec)))[:8]
+    sensors = _known(meas_sel, spec.measurement_names,
+                     list(meas_default(spec)))[:8]
     # Y_hat may be absent if that filter failed — the loop below skips None
     Y_noisy, Y_true = meas['Y_noisy'], meas['Y_true']
     Y_hat = meas.get('Y_hat')
@@ -552,7 +572,8 @@ def render_estimates(fig, engine, spec, results, est_states,
     covariance; the ANN and AI-KF do not produce a covariance, so they are drawn
     as bare lines. `ann` = {state: {raw, filt, beta}} (or {'error': msg}). """
     t, X = engine.t, engine.X
-    states = (est_states or [spec.color_state_default])[:8]
+    states = _known(est_states, spec.state_names,
+                    [spec.color_state_default])[:8]
     axs = fig.subplots(max(len(states), 1), 1, sharex=True, squeeze=False)[:, 0]
     colors = {'EKF': 'royalblue', 'UKF': 'darkorange'}
     styles = {'EKF': '--', 'UKF': '-.'}
@@ -720,3 +741,95 @@ def render_fisher_inv(fig, F_emp, F_stoch=None, k=None, cmap_name='inferno_r',
             one(ax, df, rf'$|F^{{-1}}|$ — {basis}' + kd, colorbar=False,
                 ylabels=False)
         fig.colorbar(im, cax=cax, label=r'$|F^{-1}|$')
+
+
+# ───────────────────────────── PDF export ────────────────────────────────────
+
+# Portrait letter, and how many monospace lines fit on one at _PDF_FS points.
+_PDF_PAGE = (8.5, 11.0)
+_PDF_FS = 8.5
+_PDF_LINES = 62
+
+
+def _wrap(value, width=64):
+    """ Break a long value (a Q diagonal, a state list) across lines so it stays
+    inside the page instead of running off the right edge. """
+    text = str(value)
+    if len(text) <= width:
+        return [text]
+    out, line = [], ''
+    for piece in text.split(', '):
+        add = piece if not line else f'{line}, {piece}'
+        if len(add) > width and line:
+            out.append(line + ',')
+            line = piece
+        else:
+            line = add
+    if line:
+        out.append(line)
+    return out
+
+
+def _meta_lines(meta):
+    """ [(section, [(label, value), ...]), ...] -> flat monospace lines. """
+    lines = []
+    for section, pairs in meta:
+        lines.append('')
+        lines.append(section.upper())
+        lines.append('─' * 72)
+        for label, value in pairs:
+            chunks = _wrap(value)
+            lines.append(f'  {label:<26} {chunks[0]}')
+            for extra in chunks[1:]:
+                lines.append(f'  {"":<26} {extra}')
+    return lines
+
+
+def _text_page(lines, title=None, page_no=None, n_pages=None):
+    """ One portrait page of monospace text. """
+    fig = Figure(figsize=_PDF_PAGE)
+    y, dy = 0.955, 1.0 / (_PDF_LINES + 8)
+    if title:
+        fig.text(0.07, y, title, fontsize=15, weight='bold', va='top')
+        y -= dy * 2.4
+    for line in lines:
+        weight = 'bold' if line and line == line.upper() and line[:1].isalpha() \
+            else 'normal'
+        fig.text(0.07, y, line, fontsize=_PDF_FS, family='monospace',
+                 weight=weight, va='top')
+        y -= dy
+    if page_no is not None:
+        fig.text(0.93, 0.035, f'{page_no}/{n_pages}', fontsize=8,
+                 color='0.45', ha='right')
+    return fig
+
+
+def analysis_pdf(path, figs, meta, title='Observability analysis'):
+    """ Write a one-file report: a parameter summary, then every panel.
+
+    `figs` is [(caption, Figure), ...] — a None figure (an unselected matrix
+    panel) is skipped. `meta` is [(section, [(label, value), ...]), ...].
+
+    The panel figures are saved as-is and never mutated: they are the same
+    objects the live page is showing, so stamping captions onto them would edit
+    the UI's plots and pile up on every download. Their order is listed on the
+    summary page instead. """
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    panels = [(cap, f) for cap, f in figs if f is not None]
+    # captions are listed in order rather than by page number: the summary can
+    # run to more than one page, so a printed number would be guesswork
+    body = _meta_lines(meta + [('panels that follow',
+                                [(f'{i + 1}.', cap)
+                                 for i, (cap, _) in enumerate(panels)])])
+    pages = [body[i:i + _PDF_LINES] for i in range(0, len(body), _PDF_LINES)] \
+        or [[]]
+    n_pages = len(pages) + len(panels)
+    with PdfPages(path) as pp:
+        for i, chunk in enumerate(pages):
+            pp.savefig(_text_page(chunk, title=(title if i == 0 else None),
+                                  page_no=i + 1, n_pages=n_pages))
+        for cap, fig in panels:
+            pp.savefig(fig)
+        pp.infodict()['Title'] = title
+    return path

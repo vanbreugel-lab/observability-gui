@@ -1182,6 +1182,33 @@ class ObservabilityEngine:
             var0 = np.where(use, v, var0)
         return Y, xh0, np.diag(var0), R, U_used
 
+    def _sensor_subset(self, sensors, Y, R):
+        """ Restrict an estimation problem to a subset of measurement channels, so the
+        filters can be driven by exactly the sensors the observability analysis uses
+        rather than by all of h(). Returns (h_sel, Y_sel, R_sel, ang_idx) where h_sel(x,
+        u) yields only those channels and ang_idx indexes the angular ones WITHIN the
+        subset — indexing angular channels against the FULL vector would wrap the wrong
+        columns once a subset is in play.
+
+        `sensors` = None (or empty) keeps every channel, which is the previous
+        behaviour, so callers that do not care are unaffected. Order follows
+        `spec.measurement_names`, not the caller's list, so the same set always
+        produces the same problem. """
+        s = self.spec
+        names = list(s.measurement_names)
+        sel = set(sensors) if sensors else set(names)
+        unknown = sel - set(names)
+        if unknown:
+            raise ValueError(f'unknown sensors {sorted(unknown)}; '
+                             f'expected a subset of {names}')
+        sidx = np.array([i for i, m in enumerate(names) if m in sel], dtype=int)
+        if not len(sidx):
+            raise ValueError('no sensors selected: the filters need at least one '
+                             'measurement channel')
+        ang = [j for j, i in enumerate(sidx) if names[i] in s.angle_measurements]
+        h_sel = lambda x, u: np.asarray(s.h(x, u), dtype=float)[sidx]
+        return h_sel, Y[:, sidx], R[np.ix_(sidx, sidx)], ang
+
     def _ann_training_data(self, ann, n_traj, seed):
         """ Training trajectories for the ANN, the way the authors' repo makes
         them: run the system's OWN MPC over perturbed set-points and keep every
@@ -1420,9 +1447,13 @@ class ObservabilityEngine:
     def run_ekf(self, q_diag, r_diag, seed=0, full_cov=False,
                 x0_scale=1.0, x0_offset=None, u_noise_var=0.0, u_bias=None, p0_diag=None,
                 x0_guess=None, f_jac_at='post', fd_eps_scaled=False,
-                q_noise='uncorrelated'):
+                q_noise='uncorrelated', sensors=None):
         """ EKF along the true trajectory (finite-difference Jacobians of the
         RK4 step and of h). Returns (X_hat, P_diag), post-update values;
+
+        `sensors` restricts the filter to a subset of the measurement channels —
+        pass the same selection the observability analysis uses so the estimator
+        and the Gramians answer the same question. None means every channel.
 
         Aligned with the BOUNDS reference EKF (util/extended_kalman_filter.py::EKF):
         `f_jac_at='post'` linearizes F about the PROPAGATED state as the reference
@@ -1447,8 +1478,7 @@ class ObservabilityEngine:
         # cached stack the stochastic gramian sees.
         Qds = (self._lin(q_diag, q_noise)[2] if q_noise == 'vanloan' else
                [np.diag([q_diag[nm] for nm in s.state_names])] * self.N)
-        ang_m = [i for i, m in enumerate(s.measurement_names)
-                 if m in s.angle_measurements]
+        h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
         wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
 
         def jac(func, x, u, eps=1e-6):
@@ -1467,8 +1497,8 @@ class ObservabilityEngine:
         I_n = np.eye(n)
         for k in range(self.N):
             # measurement update
-            C = jac(s.h, xh, U[k])
-            innov = Y[k] - np.asarray(s.h(xh, U[k]), dtype=float)
+            C = jac(h_sel, xh, U[k])
+            innov = Y[k] - h_sel(xh, U[k])
             if ang_m:
                 innov[ang_m] = wrap(innov[ang_m])
             S = C @ P @ C.T + R
@@ -1494,12 +1524,15 @@ class ObservabilityEngine:
     def run_ukf(self, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
                 full_cov=False, x0_scale=1.0, x0_offset=None, u_noise_var=0.0,
                 u_bias=None, p0_diag=None, x0_guess=None,
-                q_noise='uncorrelated'):
+                q_noise='uncorrelated', sensors=None):
         """ UKF on the identical problem realization as run_ekf (same seed →
         same measurements and initial estimate). Merwe scaled unscented
         transform with tunable spread α, prior β, secondary scaling κ (defaults
         α = 1, κ = 0 → sigma points at sqrt(n)·σ), with circular means / wrapped
-        residuals for the arctan2 measurements. """
+        residuals for the arctan2 measurements.
+
+        `sensors` restricts the filter to a subset of the measurement channels,
+        exactly as in run_ekf; None means every channel. """
         s = self.spec
         n = len(s.state_names)
         sim = self._rk4_sim()
@@ -1515,8 +1548,7 @@ class ObservabilityEngine:
         # cached stack the stochastic gramian sees.
         Qds = (self._lin(q_diag, q_noise)[2] if q_noise == 'vanloan' else
                [np.diag([q_diag[nm] for nm in s.state_names])] * self.N)
-        ang_m = [i for i, m in enumerate(s.measurement_names)
-                 if m in s.angle_measurements]
+        h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
         wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
 
         lam_s = alpha ** 2 * (n + kappa) - n     # Merwe scaling parameter
@@ -1555,8 +1587,7 @@ class ObservabilityEngine:
         for k in range(self.N):
             # measurement update
             pts = sigma_points(xh, P)
-            Ys = np.array([np.asarray(s.h(pt, U[k]), dtype=float)
-                           for pt in pts])
+            Ys = np.array([h_sel(pt, U[k]) for pt in pts])
             ym, dY = y_stats(Ys)
             dX = pts - xh
             S_cov = dY.T @ (Wc[:, None] * dY) + R

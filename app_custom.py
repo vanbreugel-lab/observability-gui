@@ -26,6 +26,8 @@ import contextlib
 import socket
 import threading
 import importlib.util
+import tempfile
+from datetime import datetime
 
 # do-mpc prints ONNX/opcua "feature not available" UserWarnings on import; they
 # are informational (those optional extras just aren't installed) — hush them.
@@ -57,9 +59,11 @@ import render
 # reads as a flat namespace.
 import core
 from core import (SYSTEM_LABELS, LAM_VALS, EPS_VALS, DT_HZ, CMAPS, _BASE_HZ,
-                  ANN_ENABLED, get_spec, build_setpoint, compute_payload,
+                  ANN_ENABLED, FILTER_BACKENDS, DYNAMAX_AVAILABLE,
+                  get_spec, build_setpoint, compute_payload,
                   _figs_from_payload, _est_defaults, _realization,
                   _q_rows_default, _r_rows_default, _x0_rows, _x0_vec,
+                  _p0_rows, _p0_vec,
                   _axis_rows, _axis_lims, _ylim_dict, _lim, _parse_layers,
                   _uniform_dict,
                   _default_r, _r_rows, _q_rows, _table_dict)
@@ -235,6 +239,137 @@ def on_select_physical(phys_traj, obj_id, custom_spec):
             f'✓ trajectory {obj_id}: {n} steps. Reconstructing via MPC…')
 
 
+def _traj_source(recorded, segs, custom_spec):
+    """ Where the set-point came from — mirrors build_setpoint's precedence. """
+    if custom_spec is not None:
+        return 'uploaded custom system'
+    if isinstance(recorded, dict) and 'pos' in recorded:
+        return 'uploaded position track'
+    if segs:
+        return f'motif segments ({len(segs)})'
+    if recorded is not None:
+        return 'drawn / measured path'
+    return 'system default trajectory'
+
+
+def _fmt_diag(d, names):
+    """ A per-name diagonal as 'name=value' pairs, or one value if uniform. """
+    vals = [d[n] for n in names]
+    if len(set(vals)) == 1:
+        return f'{vals[0]:.3e} (uniform, all {len(names)})'
+    return ', '.join(f'{n}={d[n]:.3e}' for n in names)
+
+
+def _fmt_p0(vec, names):
+    """ P₀ as it was actually applied: pinned entries by name, the rest noted as
+    following their initial guess (see core._estimation_problem). """
+    if vec is None:
+        return 'from initial guess (all states)'
+    pinned = [f'{n}={v:.4g}' for n, v in zip(names, vec) if np.isfinite(v)]
+    rest = len(names) - len(pinned)
+    return ', '.join(pinned) + (f'  (+{rest} from initial guess)' if rest else '')
+
+
+def _fmt_x0(vec, names):
+    if vec is None:
+        return 'seeded random draw (all states)'
+    pinned = [f'{n}={v:.4g}' for n, v in zip(names, vec) if np.isfinite(v)]
+    rest = len(names) - len(pinned)
+    return ', '.join(pinned) + (f'  (+{rest} from seeded draw)' if rest else '')
+
+
+def _analysis_meta(spec, engine, system, dt_hz, p, disp, est, payload, status,
+                   recorded, segs, custom_spec):
+    """ The summary that heads the exported PDF: enough to reproduce the run. """
+    sn, mn = list(spec.state_names), list(spec.measurement_names)
+    w_used = int(min(p['w_raw'], max(engine.N - 1, 3)))
+    inames = list(spec.input_names)
+
+    def inj(e):
+        if not e['ub']:
+            return 'none'
+        ch, mag, t0, t1 = e['ub']
+        name = inames[ch] if 0 <= ch < len(inames) else str(ch)
+        return f'{name} {mag:+g} on [{t0:g}, {t1:g}] s'
+
+    out = [
+        ('run', [
+            ('generated', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            ('status', status.lstrip('✓ ')),
+        ]),
+        ('system', [
+            ('name', 'custom (uploaded)' if custom_spec is not None else system),
+            ('dt', f'{spec.dt:g} s  ({float(dt_hz):g} Hz)'),
+            ('trajectory', f'{engine.N} steps  ({engine.N * spec.dt:g} s)'),
+            ('trajectory source', _traj_source(recorded, segs, custom_spec)),
+            ('states', f'{len(sn)}: ' + ', '.join(sn)),
+            ('measurements', f'{len(mn)}: ' + ', '.join(mn)),
+            ('inputs', f'{len(inames)}: ' + ', '.join(inames)),
+        ]),
+        ('observability', [
+            ('window w', f'{w_used} steps  ({w_used * spec.dt:g} s)'
+             + ('  [clamped from '
+                f'{int(p["w_raw"])}]' if w_used != int(p['w_raw']) else '')),
+            ('lambda (regularizer)', f'{p["lam"]:.3e}'),
+            ('epsilon (finite diff)', f'{disp["eps"]:.3e}'),
+            ('round-off floor', f'{payload["floor"]:.3e}'),
+            ('sensors used', ', '.join(p['sensors'])),
+            ('states reported', ', '.join(p['states'])),
+            ('process noise', 'on' if p['do_stoch'] else 'off (Q ≈ 0)'),
+            ('gramian bases', ', '.join(p['bases']) or 'none'),
+            ('Q correlation', p['q_noise']),
+            ('Q diagonal', _fmt_diag(p['q_diag'], sn)),
+            ('R diagonal', _fmt_diag(p['r_diag'], mn)),
+        ]),
+    ]
+    # which implementation ran the filters: payload['backend'] is what actually
+    # ran, which can differ from what was asked for if dynamax was missing
+    # est['EKF'] == est['UKF'] exactly when the shared controls drove both (see
+    # _compute), so the report says which it was without another parameter
+    same = all(np.array_equal(np.asarray(est['EKF'][k], dtype=object),
+                              np.asarray(est['UKF'][k], dtype=object))
+               for k in ('seed', 'unv', 'ub', 'x0', 'p0'))
+    out.append(('estimators', [
+        ('implementation',
+         'dynamax (JAX)' if payload.get('backend') == 'dynamax'
+         else 'this repo (NumPy)'),
+        ('realization', 'shared — one set of values drove both filters' if same
+         else 'independent per filter (UKF override on)'),
+    ]))
+    for name in ('EKF', 'UKF'):
+        e = est[name]
+        # ASCII labels: the summary page is DejaVu Sans Mono, which renders
+        # combining diacritics (x-hat) and subscripts poorly
+        rows = [('noise seed', e['seed']),
+                ('initial guess x0', _fmt_x0(e['x0'], sn)),
+                ('P0 diagonal', _fmt_p0(e['p0'], sn)),
+                ('input noise var', f'{e["unv"]:g}'),
+                ('injected input bias', inj(e))]
+        if name == 'UKF':
+            rows.append(('sigma points',
+                         f'alpha={est["ukf_alpha"]:g}, beta={est["ukf_beta"]:g}, '
+                         f'kappa={est["ukf_kappa"]:g}'))
+        out.append((f'{name} realization', rows))
+    out.append(('timing', [
+        ('empirical FIM', f'{payload["t_emp"]:.2f} s'),
+        ('stochastic gramians', f'{payload["t_stoch"]:.2f} s'),
+    ] + ([('ANN / AI-KF', f'{payload["t_ann"]:.2f} s')]
+         if payload.get('t_ann') else [])))
+    return out
+
+
+# How many FIGURE outputs _compute returns, before (status, session). Every
+# early return has to pad to exactly this many gr.update() no-ops: Gradio
+# matches the response tuple against its output list by length, so a short
+# tuple is rejected wholesale and the carefully-worded ⚠ status never reaches
+# the page — the user gets an unexplained error box instead. This used to be a
+# literal 6 in three places while seven figures were wired, which meant EVERY
+# error path (a stale sensor selection, a singular matrix, a custom system
+# without position_states) surfaced as a crash rather than as its message.
+# tests/test_compute.py pins this against COMPUTE_OUT.
+_N_FIGS = 7
+
+
 def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
              wind, zeta, w, lam, eps, r_mode, r_uniform, r_table, do_stoch,
              q_obs, q_con, q_mode, q_noise, q_uniform, q_table,
@@ -244,12 +379,12 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
              m_noisy, m_true, m_pred, m_ukf, m_ann, m_aikf,
              ekf_seed, ekf_x0, ekf_ch, ekf_mag, ekf_t0, ekf_t1, ekf_unv, ekf_p0,
              ukf_seed, ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv, ukf_p0,
-             ukf_alpha, ukf_beta, ukf_kappa,
+             ukf_alpha, ukf_beta, ukf_kappa, est_split, est_backend,
              ann_target, ann_layers, ann_steps, ann_traj, ann_epochs,
              ann_batch, ann_noise,
              aikf_motif, aikf_window, aikf_upper, aikf_r_hi, aikf_r_lo,
              st_ytbl, ms_ytbl,
-             mat_k, fi_k, rebuild):
+             mat_k, fi_k, rebuild, progress=None):
     sess = sess or {}
     spec = sess.get('spec')
     engine = sess.get('engine')
@@ -262,12 +397,15 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
             sess = dict(system='custom', spec=spec, engine=engine,
                         cid=id(custom_spec))
             rebuild = True
+        # NB: the no-op count must equal the number of FIGURE outputs (see
+        # _N_FIGS) — one short and Gradio rejects the whole response, so the
+        # user gets an unexplained red box instead of the message below.
         if not spec.position_states:
-            return (gr.update(),) * 6 + (
+            return (gr.update(),) * _N_FIGS + (
                 '⚠ this custom system declares no position_states, so MPC '
                 'reconstruction from a measured path is unavailable', sess)
         if recorded is None:
-            return (gr.update(),) * 6 + (
+            return (gr.update(),) * _N_FIGS + (
                 '⚠ upload a physical (x, y) trajectory for the custom system', sess)
     else:
         dt_val = 1.0 / float(dt_hz)
@@ -305,6 +443,12 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
     p = dict(w_raw=int(w), eps=float(eps), lam=float(lam), r_diag=r_diag,
              q_diag=q_diag, q_noise=str(q_noise), sensors=sensors, states=states,
              do_stoch=bool(do_stoch) and bool(bases), bases=bases,
+             # which EKF/UKF implementation runs: this repo's NumPy filters or
+             # dynamax's JAX ones on the identical problem (see
+             # engine/dynamax_filters.py). An unavailable dynamax falls back to
+             # 'engine' inside compute_payload and says so in the status.
+             backend=(est_backend if est_backend in
+                      [v for _l, v in FILTER_BACKENDS] else 'engine'),
              # hard gate: a stale browser session could still post True
              do_ann=ANN_ENABLED and (bool(s_ann) or bool(s_aikf)),
              ann_target=(ann_target if ann_target in spec.state_names
@@ -319,8 +463,17 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
              aikf_upper=max(1e-9, float(aikf_upper or 0.5)),
              aikf_r_hi=max(1e-30, float(aikf_r_hi or 1e12)),
              aikf_r_lo=max(1e-30, float(aikf_r_lo or 1e-3)))
-    # one independent estimation problem per filter (see _realization), plus the
-    # UKF's sigma-point tuning, which the AI-KF also uses
+    # One estimation problem per filter (see _realization), plus the UKF's
+    # sigma-point tuning, which the AI-KF also uses.
+    #
+    # Unless the UKF has been given its own data (est_split), it reuses the
+    # shared controls, so a single edit moves both filters and they are on
+    # identical data by construction rather than by the user keeping two sets of
+    # boxes in sync. The UKF's own widgets keep their values while hidden, so
+    # turning the override back on restores what was there.
+    if not est_split:
+        (ukf_seed, ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv, ukf_p0) = (
+            ekf_seed, ekf_x0, ekf_ch, ekf_mag, ekf_t0, ekf_t1, ekf_unv, ekf_p0)
     est = dict(
         EKF=_realization(spec, ekf_seed, ekf_ch, ekf_mag, ekf_t0, ekf_t1,
                          ekf_unv, ekf_x0, ekf_p0),
@@ -329,8 +482,19 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
         ukf_alpha=float(ukf_alpha or 1.0), ukf_beta=float(ukf_beta or 0.0),
         ukf_kappa=float(ukf_kappa or 0.0))
 
+    # Stage-level progress. A long drawn path spends most of a minute inside
+    # compute_payload (MPC, then the O(N·w) empirical FIM); without this the page
+    # sits on an indeterminate spinner and reads as a hang.
+    def _stage(frac, label):
+        if progress is None:
+            return
+        try:
+            progress(frac, desc=label)
+        except Exception:
+            pass        # no live request (on_system, smoke test) — just compute
+
     try:
-        payload = compute_payload(engine, job, p, est)
+        payload = compute_payload(engine, job, p, est, on_stage=_stage)
     except np.linalg.LinAlgError as e:
         payload = {'error': f'singular matrix ({e}) — raise λ or adjust R/Q'}
     except Exception as e:                          # never crash the UI
@@ -339,7 +503,7 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
     if 'error' in payload:
         status = f'⚠ {payload["error"]}'
         no = gr.update()
-        return (no,) * 6 + (status, sess)
+        return (no,) * _N_FIGS + (status, sess)
 
     disp = dict(color=color, ev_states=ev_states, est_states=est_states,
                 meas_sel=meas_sel, arrowhead=(traj_mode == 'arrowhead'),
@@ -355,6 +519,7 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
                 q_noise=p['q_noise'],
                 eps=float(eps), r_diag=r_diag, lam=float(lam),
                 sensors=sensors, states=states)
+    _stage(0.92, 'drawing figures')
     fig_main, fig_O, fig_Finv, fig_minev, fig_est, fig_meas, fig_inputs = _figs_from_payload(
         engine, spec, payload, disp)
 
@@ -372,6 +537,24 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
         modes += ' | ⚠ process noise on but no FIM basis selected'
     status = f'✓ done — {note + " | " if note else ""}{modes}{floor_note}'
 
+    # Stash everything the PDF export needs, in the per-session state. The
+    # download button reads this instead of recomputing, so the report is exactly
+    # the analysis on screen — not a fresh run that could differ if a control was
+    # nudged after Simulate.
+    sess['analysis'] = dict(
+        figs=[('Trajectory & observability', fig_main),
+              # plain ASCII names: these are listed on the summary page in
+              # DejaVu Sans Mono, which has no glyph for script-O or superscript
+              # -1 and would emit a missing-glyph warning per render
+              ('Observability / constructability matrix O', fig_O),
+              ('Inverse Fisher information |F^-1|', fig_Finv),
+              ('Minimum error variance vs window', fig_minev),
+              ('States — true / EKF / UKF', fig_est),
+              ('Measurements', fig_meas),
+              ('Inputs', fig_inputs)],
+        meta=_analysis_meta(spec, engine, system, dt_hz, p, disp, est, payload,
+                            status, recorded, segs, custom_spec))
+
     # matrix figures return None when unselected → clears the plot; the core
     # est/meas panels keep their previous content when unavailable.
     return (fig_main, fig_O, fig_Finv, fig_minev,
@@ -388,23 +571,62 @@ def _compute(sess, custom_spec, segs, recorded, system, dt_hz, v0,
 _COMPUTE_LOCK = threading.Lock()
 
 
-def simulate(*args):
-    """ Re-solve the MPC trajectory, then compute + render. """
+def simulate(*args, progress=gr.Progress()):
+    """ Re-solve the MPC trajectory, then compute + render.
+
+    `progress` is filled in by Gradio for real clicks; on_system calls this
+    directly, where the default instance is inert. """
     with _COMPUTE_LOCK:
-        return _compute(*args, rebuild=True)
+        return _compute(*args, rebuild=True, progress=progress)
 
 
-def update(*args):
+def update(*args, progress=gr.Progress()):
     """ Recompute from the existing trajectory (cheap — the engine caches the
     filter results by key) and render. """
     with _COMPUTE_LOCK:
-        return _compute(*args, rebuild=False)
+        return _compute(*args, rebuild=False, progress=progress)
 
 
-def on_system(system):
+# Exported PDFs land here. One fixed directory rather than a fresh mkdtemp each
+# time, because Gradio only serves files from paths it has been given: this is
+# passed to launch(allowed_paths=...) below, and a random temp dir would be
+# refused by the file route. Names carry a timestamp, so they don't collide.
+EXPORT_DIR = os.path.join(tempfile.gettempdir(), 'observability_exports')
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+
+def download_analysis(sess):
+    """ Write the on-screen analysis to a PDF and hand it back for download.
+
+    Reads the bundle _compute stashed in the session, so the report is the run
+    the user is looking at. Returns None (nothing to download) if Simulate has
+    not produced anything yet. """
+    bundle = (sess or {}).get('analysis')
+    if not bundle:
+        gr.Warning('Press ▶ Simulate first — there is no analysis to export yet.')
+        return None
+    system = (sess or {}).get('system', 'system')
+    stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+    path = os.path.join(EXPORT_DIR, f'observability_{system}_{stamp}.pdf')
+    with _COMPUTE_LOCK:            # matplotlib is not thread-safe; see below
+        render.analysis_pdf(path, bundle['figs'], bundle['meta'],
+                            title=f'Observability analysis — {system}')
+    return path
+
+
+def on_system(system, est_backend='engine', est_split=False):
     """ Switch systems: reset every control to the new system's defaults AND
     recompute the figures in one call. The special 'custom' entry doesn't build
-    a spec — it just reveals the system-.py uploader and waits. """
+    a spec — it just reveals the system-.py uploader and waits.
+
+    This is also what the ↺ Reset button runs: it is handed a fresh session, so
+    a brand-new ObservabilityEngine is built and every cache (trajectory,
+    Gramians, filter results, trained nets) goes with the old one.
+
+    Every control is reset except the two that describe *how* to filter rather
+    than *what* system to filter — the backend and the UKF-override switch.
+    Those are passed in and passed straight through, so the figures keep
+    matching what those controls still show. """
     if system == 'custom':
         no = gr.update()
         return (no, no, no, no, no, no,             # sensor/state controls: no-op
@@ -456,6 +678,7 @@ def on_system(system):
                     0, d['x0'], ij['channel'], ij['mag'], ij['t0'], ij['t1'],
                     d['u_noise'], d['p0'],
                     d['ukf_alpha'], d['ukf_beta'], d['ukf_kappa'],
+                    est_split, est_backend,
                     an['target'], an['layers'], an['time_steps'], an['n_traj'],
                     an['epochs'], an['batch'], an['noise'],
                     ak['motif'], ak['window'], ak['upper'], ak['r_hi'],
@@ -490,16 +713,19 @@ def on_system(system):
         None, '', '',                                # drawing: recorded, status, JSON bridge
         None,                                        # clear custom system
         gr.update(visible=False),                    # hide sys_file for built-ins
-        # EKF initial guess + disturbance, then the UKF's own copies. The
-        # guess table MUST be reset: its rows are the new system's state names.
+        # EKF initial guess + disturbance, then the UKF's own copies. The guess
+        # and P₀ tables MUST be reset: their rows are the new system's state
+        # names.
         gr.update(value=d['x0']),
         gr.update(choices=['none'] + list(s.input_names), value=ij['channel']),
         gr.update(value=ij['mag']), gr.update(value=ij['t0']),
         gr.update(value=ij['t1']), gr.update(value=d['u_noise']),
+        gr.update(value=d['p0']),
         gr.update(value=d['x0']),
         gr.update(choices=['none'] + list(s.input_names), value=ij['channel']),
         gr.update(value=ij['mag']), gr.update(value=ij['t0']),
         gr.update(value=ij['t1']), gr.update(value=d['u_noise']),
+        gr.update(value=d['p0']),
         gr.update(value=d['ukf_alpha']), gr.update(value=d['ukf_beta']),
         gr.update(value=d['ukf_kappa']),
         gr.update(choices=list(s.state_names), value=an['target']),
@@ -584,6 +810,10 @@ def apply_drawing(draw_json, system, v0, dur):
         data = json.loads(draw_json) if draw_json else {}
     except (ValueError, TypeError):
         data = {}
+    # valid JSON is not necessarily an object: 'null' and '[]' both parse, and
+    # both used to reach .get() and raise AttributeError out of the callback
+    if not isinstance(data, dict):
+        data = {}
     recorded, note = core.canvas_to_recorded(
         get_spec(system), data.get('pts', []), data.get('w', 1),
         data.get('h', 1), v0, dur)
@@ -603,15 +833,17 @@ APP_TAGLINE = ('choose a system and motif, examine state observability, '
 # clean light theme
 THEME = gr.themes.Soft(primary_hue='blue', neutral_hue='slate')
 
-# App load JS: (1) lock light mode (matplotlib figures render on white), then
-# (2) wire the drawing <canvas> — DRAG = freehand, CLICK = waypoint. On
+# App load JS: wire the drawing <canvas> — DRAG = freehand, CLICK = waypoint. On
 # pointer-up it writes the points to the hidden #draw_data textbox for Python.
+#
+# This used to begin by forcing ?__theme=light, which made the theme switch a
+# no-op: any attempt to go dark was redirected straight back. The lock is gone,
+# so light/dark is the user's choice again. The matplotlib panels are still
+# rendered light (render.py sets no facecolors, so they inherit matplotlib's
+# white default) and will look like bright cards on a dark page — a cosmetic
+# mismatch, deliberately accepted rather than blocking the switch.
 _APP_JS = """
 () => {
-  const u = new URL(location);
-  if (u.searchParams.get('__theme') !== 'light') {
-    u.searchParams.set('__theme', 'light'); location.href = u.href; return;
-  }
   // Tutorial: glow the section(s) for the current step and scroll to them.
   const TUT_MAP = {0: ['sec_system', 'sec_traj'], 1: ['sec_mpc'],
                    2: ['sec_obs'], 3: ['sec_estimator'], 4: ['sec_plot'],
@@ -722,8 +954,8 @@ TUT_STEPS = [
     dict(img=os.path.join(TUT_DIR, 'observability.png'), h=250,
          title='Step 3 — Investigate observability',
          body='Choose the sensor/state combination that you want for your system, '
-              'empirical perturbation value ($\epsilon$), window size for each calculation ($w$), and noise '
-              'levels R (and, optionally, Q). This pipeline perturbs each state by $\epsilon$, builds the '
+              r'empirical perturbation value ($\epsilon$), window size for each calculation ($w$), and noise '
+              r'levels R (and, optionally, Q). This pipeline perturbs each state by $\epsilon$, builds the '
               'observability matrix $\\mathcal{O}$, the Fisher information '
               '$\\mathcal{F}=\\mathcal{O}^{\\mathsf T}R^{-1}\\mathcal{O}$, and '
               'its inverse — whose diagonal is the minimum error variance of '
@@ -1028,6 +1260,61 @@ the regularizer $\lambda$):
 - $\kappa$ — **secondary scaling** (usually 0).
 """
 
+EQ_BACKENDS = r"""
+The same two filters are available in **two independent implementations**, and
+the **EKF / UKF implementation** control in the Estimators section chooses which
+one runs. The point is validation: the min-error-variance curve is a *bound* on
+what an estimator can do, so it matters that the estimator it is compared
+against is correct. Getting the same trajectory out of a widely used
+third-party filter is evidence that neither implementation is fooling us.
+
+| | this repo (NumPy) | dynamax (JAX) |
+|---|---|---|
+| code | `ObservabilityEngine.run_ekf` / `run_ukf` | `dynamax.nonlinear_gaussian_ssm` |
+| $\Phi_k,C_k$ (EKF) | central differences, step $10^{-6}$ | exact (autodiff) |
+| EKF linearization point | propagated state $\hat x^{-}_{k+1}$ | filtered mean $\hat x^{+}_k$ |
+| covariance update | Joseph form | $P-KSK^{\mathsf T}$ |
+| angular channels | innovations wrapped to $(-\pi,\pi]$, circular sigma-point means | wrapped — folded into $h$, see below |
+| $Q_k$ | per-step stack (Van Loan) supported | EKF yes; UKF constant $Q$ only |
+| $\sqrt{P}$ (UKF) | Cholesky, eigendecomposition fallback | Cholesky (NaN if $P$ is not PD) |
+
+Everything *upstream* of the recursion is shared, not re-derived: the noisy
+measurements $Y$, initial estimate $\hat x_0$, $P_0$, the perturbed inputs $U$
+(same seed → same draw), the sensor subset, and $R$, $Q$. So a difference in the
+plotted estimate is a difference between the two filters, not between two
+problems.
+
+**Angular channels in JAX.** dynamax knows nothing about circular measurements —
+it forms the innovation as the plain difference $y_k-h(\hat x_k)$ — so the
+wrapping is folded into $h$ instead. dynamax hands $u_k$ to $h$ at step $k$, so
+the measurement is passed along with it as $\tilde u_k=[u_k,\,y_k]$, and each
+angular channel of $h$ is shifted by whole turns to land beside its measurement:
+$$\tilde h(x,\tilde u)=h(x,u)+2\pi\left\lceil\frac{y-h(x,u)}{2\pi}\right\rfloor,$$
+with $\lceil\cdot\rfloor$ = round-to-nearest. The plain difference
+$y-\tilde h(x)$ is then exactly the wrapped one, and because $\mathrm{round}$
+has zero derivative, $\partial\tilde h/\partial x=\partial h/\partial x$ — the
+EKF's $C_k$ is untouched. In the UKF the same shift puts every sigma point's
+measurement in one branch around $y_k$, which is what the circular
+sigma-point mean achieves on the NumPy side.
+
+**What to expect.** Agreement to $\sim10^{-9}$ on **alt2d**. On
+**fly / fly7 / drone** the two differ by up to a few percent on individual
+states — *entirely* because of the linearization point: set the NumPy EKF to
+dynamax's convention (`f_jac_at='pre'`) and the two agree to
+$5\times10^{-9}$ on every system. Exact-vs-finite-difference Jacobians
+contribute nothing measurable, and mean $|\hat x-x|$ agrees to a fraction of a
+percent either way.
+
+Requires `pip install dynamax` (which pulls in JAX). Without it the control
+falls back to the NumPy filters and the status line says so. The models
+themselves are plain NumPy, so they are rebuilt against `jax.numpy` to be
+traceable; a model that will not trace (an uploaded system using `scipy`, say)
+is instead called from JAX through `pure_callback` with central-difference
+Jacobians — automatically, and with no change in what is computed.
+
+Reference: probml/dynamax — <https://github.com/probml/dynamax>
+"""
+
 _MEAS_GLOSS = {'phi': 'heading [rad]',
                # fly: course angle; drone: yaw observed directly
                'psi': 'course angle atan2(v⊥,v∥) [rad] — fly; yaw [rad] — drone',
@@ -1150,6 +1437,11 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                                    'position_states + input_bounds for MPC)',
                                    file_types=['.py'], type='filepath',
                                    visible=False)   # shown when system = Custom
+                # Full reset: same handler as a system switch, which starts from
+                # an empty session and therefore a brand-new engine — see
+                # on_system.
+                btn_reset = gr.Button('↺ Reset engine', size='sm')
+
 
             with gr.Accordion('Build your trajectory', open=True,
                               elem_id='sec_traj') as acc_traj:
@@ -1233,6 +1525,12 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
 
                 btn_sim = gr.Button('▶ simulate (MPC)', variant='primary',
                                     elem_id='sec_mpc')
+                btn_pdf = gr.DownloadButton('⬇ download analysis (PDF)',
+                                            size='sm')
+                gr.Markdown('*Every panel currently on the page, plus a summary '
+                            'of the system, trajectory, observability settings '
+                            'and both filter realizations — enough to reproduce '
+                            'the run.*')
 
             with gr.Accordion('Investigate observability', open=True,
                               elem_id='sec_obs') as acc_obs:
@@ -1337,6 +1635,24 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                     '(`U = [u_z_noise, u_x_noise]`) — so they are perturbed '
                     'here. The truth trajectory always flies the clean '
                     'accelerations.*')
+                # implementation switch: this repo's filters, or the identical
+                # problem handed to dynamax's. Kept above the per-filter
+                # sections because it applies to both of them.
+                est_backend = gr.Radio(
+                    choices=FILTER_BACKENDS, value='engine',
+                    label='EKF / UKF implementation',
+                    info=('dynamax (probml/dynamax, JAX) runs the same problem '
+                          'through a JAX based EKF/UKF'
+                          if DYNAMAX_AVAILABLE else
+                          '**Warning: dynamax *** is not installed in your environment. '
+                          'Selecting it falls back to the standard NumPy filters. '
+                          'To use: pip install dynamax'))
+                # The long-form version of the above lives in Reference &
+                # equations -> Estimators -> Implementation (EQ_BACKENDS), so
+                # this section stays short. Short version: same problem, same
+                # seed, same R/Q/sensors; the two agree to ~5e-9 once the
+                # linearization point is matched. The ANN / AI-KF always uses
+                # this repo's UKF.
                 gr.Markdown(
                     '**R and Q come from the Observability section above** — the '
                     'estimators are deliberately given the same measurement and '
@@ -1351,25 +1667,49 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                           'value, negative included. Leave it blank and the '
                           'state starts at the truth plus a ~10% random error '
                           'drawn from the seed above.*\n\n'
-                          '*P₀ follows from this rather than being set '
-                          'separately: pinning a guess far from the truth '
-                          'widens that state\'s prior variance to match, so the '
+                          '*A state whose P₀ row is left blank takes its prior '
+                          'variance from this guess: pinning one far from the '
+                          'truth widens that state\'s P₀ to match, so the '
                           'filter starts out admitting an error the size of the '
                           'one you gave it instead of being overconfident. The '
                           'plotted ±2σ band is post-update, so a badly wrong '
                           'guess can still overshoot on the first step.*')
+                _P0_MD = ('*How much each state\'s estimate is **distrusted** at '
+                          'k=0 — the diagonal of P₀, as a variance (σ², not σ). '
+                          'Fill a row to set that state outright; leave it blank '
+                          'and that state falls back to the spread implied by '
+                          'its initial guess above. The two mix freely, so you '
+                          'can pin P₀ for one state and let the rest follow.*\n\n'
+                          '*Bigger P₀ = the filter believes the measurements '
+                          'more on the first steps and converges faster but '
+                          'noisier; smaller = it holds its guess longer. Values '
+                          '≤ 0 are ignored rather than making P₀ singular.*')
 
-                with gr.Accordion('EKF', open=False):
-                    with gr.Row():
-                        s_ekf = gr.Checkbox(value=True, label='show EKF')
-                        ekf_seed = gr.Number(value=0, precision=0,
-                                             label='noise seed')
+                with gr.Row():
+                    s_ekf = gr.Checkbox(value=True, label='show EKF')
+                    s_ukf = gr.Checkbox(value=True, label='show UKF')
+
+                # ── ONE estimation problem, driving both filters ──
+                # These used to be duplicated per filter, which meant setting up
+                # a comparison took two identical edits and a typo in one of
+                # them silently compared the filters on different data. One set
+                # now feeds both; the per-filter overrides below are opt-in for
+                # the case where facing them with different data IS the point.
+                with gr.Accordion('Initial estimate, P₀ & input disturbance '
+                                  '— both filters', open=False):
+                    gr.Markdown(
+                        '*One set of values for **both** filters, so a change '
+                        'here moves the EKF and the UKF together and they stay '
+                        'on identical data — which is what makes a head-to-head '
+                        'comparison mean anything.*')
+                    ekf_seed = gr.Number(value=0, precision=0,
+                                         label='noise seed')
                     gr.Markdown(_X0_MD)
                     ekf_x0 = gr.Dataframe(
                         headers=['state', 'initial guess'],
                         datatype=['str', 'number'], type='array',
                         value=_x0_rows(_S0), interactive=True,
-                        label='EKF initial estimate')
+                        label='initial estimate')
                     gr.Markdown(_INJ_MD)
                     with gr.Row():
                         ekf_ch = gr.Dropdown(
@@ -1381,41 +1721,60 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                         ekf_t1 = gr.Number(value=0.0, label='end t₁ [s]')
                         ekf_unv = gr.Number(value=0.0,
                                             label='input noise var (all steps)')
-                    ekf_p0 = gr.Number(
-                        value=getattr(_S0, 'p0_paper', None),
-                        label='P₀ diagonal (blank → from initial guess)')
-                with gr.Accordion('UKF', open=False):
-                    with gr.Row():
-                        s_ukf = gr.Checkbox(value=True, label='show UKF')
-                        ukf_seed = gr.Number(value=0, precision=0,
-                                             label='noise seed')
-                    gr.Markdown(_X0_MD)
-                    ukf_x0 = gr.Dataframe(
-                        headers=['state', 'initial guess'],
+                    gr.Markdown(_P0_MD)
+                    ekf_p0 = gr.Dataframe(
+                        headers=['state', 'P₀ variance'],
                         datatype=['str', 'number'], type='array',
-                        value=_x0_rows(_S0), interactive=True,
-                        label='UKF initial estimate')
+                        value=_p0_rows(_S0), interactive=True,
+                        label='P₀ diagonal')
+                with gr.Accordion('UKF sigma points', open=False):
                     gr.Markdown('*Sigma points sit at '
                                 '$\\pm\\sqrt{\\alpha^2(n+\\kappa)}\\,\\sigma$ '
-                                'about the mean.*', latex_delimiters=LATEX_DELIMS)
+                                'about the mean. UKF-only, so these are not '
+                                'shared.*', latex_delimiters=LATEX_DELIMS)
                     with gr.Row():
                         ukf_alpha = gr.Number(value=1.0, label='α (spread)')
                         ukf_beta = gr.Number(value=2.0, label='β (prior)')
                         ukf_kappa = gr.Number(value=0.0, label='κ (secondary)')
-                    gr.Markdown(_INJ_MD)
-                    with gr.Row():
-                        ukf_ch = gr.Dropdown(
-                            ['none'] + list(_S0.input_names), value='none',
-                            label='input channel')
-                        ukf_mag = gr.Number(value=0.0, label='bias magnitude')
-                    with gr.Row():
-                        ukf_t0 = gr.Number(value=0.0, label='start t₀ [s]')
-                        ukf_t1 = gr.Number(value=0.0, label='end t₁ [s]')
-                        ukf_unv = gr.Number(value=0.0,
-                                            label='input noise var (all steps)')
-                    ukf_p0 = gr.Number(
-                        value=getattr(_S0, 'p0_paper', None),
-                        label='P₀ diagonal (blank → from initial guess)')
+                with gr.Accordion('Give the UKF its own data (advanced)',
+                                  open=False):
+                    est_split = gr.Checkbox(
+                        value=False,
+                        label='UKF uses its own seed / initial estimate / P₀ / '
+                              'disturbance')
+                    gr.Markdown(
+                        '*Off (the default): the UKF ignores everything below '
+                        'and takes the shared values above.*\n\n'
+                        '*On: the two filters face **different** estimation '
+                        'problems. Useful for asking "how does this filter '
+                        'respond to a disturbance the other one never saw", but '
+                        'it is no longer a like-for-like comparison — a '
+                        'difference in the plots is then a difference in the '
+                        'data, not in the filters.*')
+                    with gr.Group(visible=False) as ukf_own:
+                        ukf_seed = gr.Number(value=0, precision=0,
+                                             label='UKF noise seed')
+                        ukf_x0 = gr.Dataframe(
+                            headers=['state', 'initial guess'],
+                            datatype=['str', 'number'], type='array',
+                            value=_x0_rows(_S0), interactive=True,
+                            label='UKF initial estimate')
+                        with gr.Row():
+                            ukf_ch = gr.Dropdown(
+                                ['none'] + list(_S0.input_names), value='none',
+                                label='input channel')
+                            ukf_mag = gr.Number(value=0.0,
+                                                label='bias magnitude')
+                        with gr.Row():
+                            ukf_t0 = gr.Number(value=0.0, label='start t₀ [s]')
+                            ukf_t1 = gr.Number(value=0.0, label='end t₁ [s]')
+                            ukf_unv = gr.Number(
+                                value=0.0, label='input noise var (all steps)')
+                        ukf_p0 = gr.Dataframe(
+                            headers=['state', 'P₀ variance'],
+                            datatype=['str', 'number'], type='array',
+                            value=_p0_rows(_S0), interactive=True,
+                            label='UKF P₀ diagonal')
                 with gr.Accordion('ANN \u2014 work in progress', open=False):
                     gr.Markdown('**\u26a0 Work in progress \u2014 disabled.** These controls are '
                                 'greyed out; the equations and repo defaults are '
@@ -1606,6 +1965,10 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                                      show_label=False, container=False,
                                      height=330)
                             gr.Markdown(EQ_UKF, latex_delimiters=LATEX_DELIMS)
+                        with gr.Accordion('Implementation (NumPy / dynamax)',
+                                          open=False):
+                            gr.Markdown(EQ_BACKENDS,
+                                        latex_delimiters=LATEX_DELIMS)
                     with gr.Accordion('ANN (artificial neural network)',
                                       open=False):
                         gr.Markdown(EQ_ANN, latex_delimiters=LATEX_DELIMS)
@@ -1680,7 +2043,7 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                   ekf_p0,
                   ukf_seed, ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv,
                   ukf_p0,
-                  ukf_alpha, ukf_beta, ukf_kappa,
+                  ukf_alpha, ukf_beta, ukf_kappa, est_split, est_backend,
                   ann_target, ann_layers, ann_steps, ann_traj, ann_epochs,
                   ann_batch, ann_noise,
                   aikf_motif, aikf_window, aikf_upper, aikf_r_hi, aikf_r_lo,
@@ -1694,8 +2057,8 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                   q_mode, q_noise, q_uniform, q_table, dt_hz,
                   v0, wind, zeta, p_duration, segs, seg_display,
                   recorded, rec_status, draw_data, custom_spec, sys_file,
-                  ekf_x0, ekf_ch, ekf_mag, ekf_t0, ekf_t1, ekf_unv,
-                  ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv,
+                  ekf_x0, ekf_ch, ekf_mag, ekf_t0, ekf_t1, ekf_unv, ekf_p0,
+                  ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv, ukf_p0,
                   ukf_alpha, ukf_beta, ukf_kappa,
                   ann_target, ann_layers, ann_steps, ann_traj, ann_epochs,
                   ann_batch, ann_noise,
@@ -1749,19 +2112,33 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                          [recorded, rec_status, segs, seg_display])
     btn_draw_clear.click(clear_recorded, None, [recorded, rec_status],
                          js=_CLEAR_JS)
-    # switching systems also wipes the canvas (extents differ per system)
+    # switching systems also wipes the canvas (extents differ per system), and
+    # so does a reset — on_system clears `recorded`, so a stroke left on screen
+    # would no longer correspond to anything
     system.change(None, None, None, js=_CLEAR_JS)
+    btn_reset.click(None, None, None, js=_CLEAR_JS)
 
     # things that change the MPC trajectory → rebuild (dt also rebuilds the
     # engine at the new timestep). .input on dt_hz = user-only, so the reset
     # in on_system doesn't re-trigger it.
     btn_sim.click(simulate, COMPUTE_IN, COMPUTE_OUT)
+    # sess only — the PDF is built from what _compute already stashed there, so
+    # the report always matches the figures on screen
+    btn_pdf.click(download_analysis, [sess], [btn_pdf])
     for comp in (v0, wind, zeta):
         comp.submit(simulate, COMPUTE_IN, COMPUTE_OUT)
     dt_hz.input(simulate, COMPUTE_IN, COMPUTE_OUT)
 
-    # system change: reset controls + recompute in one call (see on_system)
-    system.change(on_system, system, SYSTEM_OUT)
+    # system change: reset controls + recompute in one call (see on_system).
+    # est_backend / est_split ride along as inputs so the recompute uses the
+    # filter choices the user made instead of resetting them to the defaults.
+    RESET_IN = [system, est_backend, est_split]
+    system.change(on_system, RESET_IN, SYSTEM_OUT)
+    # the ↺ button is the same reset, without changing system
+    btn_reset.click(on_system, RESET_IN, SYSTEM_OUT)
+    # reveal the UKF's own realization widgets only when the override is on
+    est_split.change(lambda on: gr.update(visible=bool(on)),
+                     est_split, ukf_own)
 
     # everything else recomputes from the cached trajectory (cheap).
     # NOTE: .input (not .change) — .input fires only on real USER edits, so the
@@ -1776,7 +2153,7 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                  m_ukf, m_ann, m_aikf,
                  ekf_seed, ekf_x0, ekf_ch, ekf_mag, ekf_t0, ekf_t1, ekf_unv, ekf_p0,
                  ukf_seed, ukf_x0, ukf_ch, ukf_mag, ukf_t0, ukf_t1, ukf_unv, ukf_p0,
-                 ukf_alpha, ukf_beta, ukf_kappa,
+                 ukf_alpha, ukf_beta, ukf_kappa, est_split, est_backend,
                  ann_target, ann_layers, ann_steps, ann_traj, ann_epochs,
                  ann_batch, ann_noise,
                  aikf_motif, aikf_window, aikf_upper, aikf_r_hi, aikf_r_lo,
@@ -1837,5 +2214,10 @@ if __name__ == '__main__':
     if unknown:
         sys.exit(f'unknown argument(s): {" ".join(unknown)}\n'
                  f'usage: python {os.path.basename(__file__)} [--share]')
-    demo.launch(server_name='0.0.0.0', server_port=port, share=share,
-                theme=THEME, css=CSS, allowed_paths=[TUT_DIR])
+    # queue() is what streams gr.Progress updates to the browser — without it a
+    # long Simulate shows an indeterminate spinner instead of the stage bar.
+    # Compute is serialized by _COMPUTE_LOCK anyway (matplotlib/casadi are not
+    # thread-safe), so one worker is honest about what the server can do.
+    demo.queue(default_concurrency_limit=1).launch(
+        server_name='0.0.0.0', server_port=port, share=share,
+        theme=THEME, css=CSS, allowed_paths=[TUT_DIR, EXPORT_DIR])
