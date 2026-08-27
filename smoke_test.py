@@ -115,11 +115,20 @@ for q_obs, q_con, name in cases:
     # A figure that merely EXISTS is not enough: when a filter raised, the
     # estimator plots came back as gr.update() or silently empty. Assert the
     # traces are present, and that no estimator reported a failure.
+    # A filter may legitimately DIVERGE — since 2026-08-25 the UKF raises a clean
+    # LinAlgError when its covariance goes non-finite, where it used to return a
+    # fabricated 1e6*I and draw a meaningless band. So the requirement is not
+    # "every trace is present" but "nothing failed SILENTLY": a missing trace is
+    # acceptable only if the status says which filter failed and why.
     _need_est = {'true', 'EKF ±2σ', 'UKF ±2σ'}
     _need_meas = {'noisy samples (R)', 'noise-free h(x,u)', 'EKF prediction h(x̂)'}
-    assert _need_est <= _labels(fig_est), _need_est - _labels(fig_est)
+    _missing = _need_est - _labels(fig_est)
+    for _f in ('EKF', 'UKF'):
+        if f'{_f} ±2σ' in _missing:
+            assert f'{_f} failed' in status, (f'{_f} trace missing and status '
+                                              f'does not explain it: {status}')
+    assert 'true' not in _missing, 'the ground-truth trace must always be drawn'
     assert _need_meas <= _labels(fig_meas), _need_meas - _labels(fig_meas)
-    assert 'failed' not in status, status
     print('  figures draw cleanly and carry every expected estimator trace')
     continue
     n_traj_expected = 1 + sum([q_obs, q_con])
@@ -360,27 +369,128 @@ else:
                   or {s: 1e-4 for s in _sp.state_names})
         _r = {m: 0.1 for m in _sp.measurement_names}
         _sel = tuple(_sp.fim_sensors)
+        # Nothing is pinned but the EKF's linearization point, which the engine
+        # exposes and dynamax fixes. Both backends now take the user's sensor
+        # subset and the (cos, sin) embedding by default, and the engine's UKF
+        # leaves angular states unwrapped — the representation dynamax can also
+        # express. So this asserts the two are the SAME filter written twice,
+        # once in NumPy and once in JAX.
         _Xd, _ = dmx.run_ekf(_en, _q, _r, seed=0, sensors=_sel)
         _Xe, _ = _en.run_ekf(_q, _r, seed=0, sensors=_sel, f_jac_at='pre')
+        # The engine keeps angular STATES canonical (re-wrapped after each
+        # update, added 2026-08-25 — zeta is a wind direction, only (-pi, pi]
+        # are legal); the dynamax backend leaves them on whatever branch the
+        # recursion lands on. Same angle, different representation, so compare
+        # them wrapped or a 2*pi offset reads as a 2.07 relative error.
+        _ang = [_i for _i, _n in enumerate(_sp.state_names)
+                if _n in getattr(_sp, 'angle_states', ())]
+
+        def _canon(_A):
+            _A = np.array(_A, dtype=float)      # dynamax hands back read-only
+            if _ang:
+                _A[:, _ang] = (_A[:, _ang] + np.pi) % (2 * np.pi) - np.pi
+            return _A
+        _Xd, _Xe = _canon(_Xd), _canon(_Xe)
         _rel = (np.abs(_Xd - _Xe).max(axis=0)
                 / np.maximum(np.abs(_Xe).max(axis=0), 1e-9)).max()
-        print(f'  {_sn:6s} EKF (matched linearization point): {_rel:.2e}')
+        print(f'  {_sn:6s} EKF numpy vs jax: {_rel:.2e}')
         assert _rel < 1e-6, (_sn, _rel)
-        # and the angular wrapping must be doing something on the UKF: without
-        # it the drone's course/heading residuals cross the branch cut and the
-        # estimate moves away from the engine's
         _Xw, _ = dmx.run_ukf(_en, _q, _r, seed=0, sensors=_sel, alpha=1.0,
                              beta=2.0, kappa=0.0)
-        _Xu, _ = dmx.run_ukf(_en, _q, _r, seed=0, sensors=_sel, alpha=1.0,
-                             beta=2.0, kappa=0.0, wrap_angles=False)
+        _Xw = _canon(_Xw)
+        # wrap_states pinned OFF for this ONE comparison: the dynamax backend
+        # wraps angular MEASUREMENTS but has no circular mean for angular
+        # STATES, so the engine has to be configured the way that backend works.
+        # With the engine's default (wrap_states=True, restored 2026-08-25) the
+        # two differ by ~2 rad on the fly — that is the circular-state treatment
+        # working, not a regression.
         _Xk, _ = _en.run_ukf(_q, _r, seed=0, sensors=_sel, alpha=1.0, beta=2.0,
-                             kappa=0.0)
+                             kappa=0.0, wrap_states=False)
+        _Xk = _canon(_Xk)
         _sc = np.maximum(np.abs(_Xk).max(axis=0), 1e-9)
         _dw = (np.abs(_Xw - _Xk).max(axis=0) / _sc).max()
-        _du = (np.abs(_Xu - _Xk).max(axis=0) / _sc).max()
-        print(f'  {_sn:6s} UKF vs engine: wrapped {_dw:.2e}, '
-              f'unwrapped {_du:.2e}')
-        assert _dw <= _du * 1.001, (_sn, _dw, _du)   # wrapping never hurts
+        print(f'  {_sn:6s} UKF numpy vs jax: {_dw:.2e}')
+        # Looser than the EKF's 1e-6 on purpose. The EKF's wrap is exact — it
+        # differences two angles and wraps the result. The UKF must also average
+        # angles, and there the two backends differ irreducibly: the engine takes
+        # the circular mean atan2(sum W sin, sum W cos), while dynamax has no mean
+        # hook, so _wrap_to shifts every sigma point into one branch around y_k
+        # and dynamax then takes a plain arithmetic mean. Those agree to first
+        # order and part company at second order in the sigma-point spread, which
+        # is the ~1e-3 seen here. Closing it would need a custom UKF rather than
+        # dynamax's.
         assert _dw < 5e-3, (_sn, _dw)
+
+
+# ── every estimator must keep angular STATES in (-pi, pi] ───────────────────
+# REGRESSION GUARD. zeta is a wind direction and phi a heading: only (-pi, pi]
+# are legal values, and anything downstream — a plot, a table, a comparison
+# against another estimator — is wrong if a filter reports an angle outside it.
+# This has broken twice: run_ekf wrapped only its INNOVATION and let zeta_hat
+# reach -3.196 against a truth of -pi, and run_ukf lost its circular state
+# handling for a while. Both are fixed; this keeps them fixed.
+#
+# The offset below is deliberate: the fault only appears once the estimate is
+# pushed off the truth, and the fly and drone sit at zeta = +-pi, i.e. ON the
+# branch cut, which is the case that exposes it.
+print('\n=== angular states stay in (-pi, pi] for every estimator ===')
+
+
+class _StubANN:
+    """ A constant-angle stand-in, so run_aikf's augmented path is exercised
+    without training a network (the ANN channel stays open throughout). """
+    layers = (64, 64, 64)
+
+    def predict_series(self, Y, U=None):
+        return np.zeros(len(Y))
+
+
+for _sn in ('fly', 'fly7', 'drone', 'alt2d'):
+    _sp = C.get_spec(_sn)
+    _ang = [_i for _i, _n in enumerate(_sp.state_names)
+            if _n in getattr(_sp, 'angle_states', ())]
+    if not _ang:
+        print(f'  {_sn:6s} no angular states — nothing to check')
+        continue
+    _en = C.ObservabilityEngine(_sp)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _en.simulate_mpc(_sp.default_setpoint(getattr(_sp, 'wind_default', 0.0),
+                                              getattr(_sp, 'zeta_default', 0.0)))
+    _q = dict(getattr(_sp, 'q_realistic', None) or _sp.q_tiny)
+    _r = dict(_sp.r_default)
+    _off = {'zeta': 1.0} if 'zeta' in _sp.state_names else None
+    _sel = tuple(_sp.angle_measurements) or None
+
+    _runs = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        _runs['EKF'] = _en.run_ekf(_q, _r, seed=0, sensors=_sel,
+                                   x0_offset=_off)[0]
+        _runs['UKF'] = _en.run_ukf(_q, _r, seed=0, sensors=_sel, x0_offset=_off,
+                                   alpha=1.0, beta=2.0, kappa=0.0)[0]
+        if 'zeta' in _sp.state_names:
+            _key = (_sp.name, 'zeta', 4, _StubANN.layers, 16, 100, 256,
+                    round(0.0, 6), 0)
+            _en._ann_cache[_key] = _StubANN()
+            _runs['AI-KF'] = _en.run_aikf(
+                'zeta', _q, _r, seed=0, time_steps=4, layers=_StubANN.layers,
+                n_traj=16, epochs=100, batch=256, noise_std=0.0,
+                x0_offset=_off, sensors=_sel, alpha=1.0, beta=2.0,
+                kappa=0.0)[0]
+
+    for _nm, _X in _runs.items():
+        _A = np.asarray(_X)[:, _ang]
+        _A = _A[np.all(np.isfinite(_A), axis=1)]      # a diverged run is a
+        if not len(_A):                               # separate failure mode
+            print(f'  {_sn:6s} {_nm:6s} diverged — no finite states to check')
+            continue
+        _lo, _hi = float(_A.min()), float(_A.max())
+        _bad = np.abs(_A) > np.pi + 1e-9
+        assert not _bad.any(), (
+            f'{_sn} {_nm}: {int(_bad.sum())} angular state values outside '
+            f'(-pi, pi] — range {_lo:+.4f} .. {_hi:+.4f}. Angular states must be '
+            f'wrapped after every update; see run_ekf/run_ukf.')
+        print(f'  {_sn:6s} {_nm:6s} {len(_A)} steps x {len(_ang)} angular '
+              f'states, range {_lo:+.4f} .. {_hi:+.4f}  ✓')
+
 
 print('\nALL SMOKE CHECKS PASS')

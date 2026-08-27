@@ -109,7 +109,7 @@ The suite is organised by what it protects, rather than by module:
 | `tests/test_tables.py` | the entry parsers — blank rows, stray letters, negative variances, names left over from another system. This is where a user's typing lands, and none of it may raise out of a callback |
 | `tests/test_specs.py` | every built-in system's self-consistency: `f`/`h` return their declared dimensions, and every declared sensor/state actually exists. Nothing checks this at import time |
 | `tests/test_trajectory.py` | set-point precedence, and the drawing canvas given degenerate input (one click, a repeated point, a 400-point scribble, a zero-size canvas) |
-| `tests/test_engine.py` | the invariants the app's *claims* rest on: same seed → identical problem, P stays positive (the ±2σ band), min-EV scales with R and responds to λ, more sensors never loosen the bound, caches invalidate when they must |
+| `tests/test_engine.py` | the invariants the app's claims rest on: same seed → identical problem, P stays positive (the ±2σ band), min-EV scales with R and responds to λ, more sensors never loosen the bound, caches invalidate when they must |
 | `tests/test_compute.py` | one refresh end to end, with control values that fight the numerics — a window longer than the trajectory, no sensors selected, λ below the round-off floor, R = 0. Also pins the Gradio wiring against `_compute`'s signature, by position and by name |
 | `tests/test_app_robustness.py` | the upload paths: a system `.py` missing `f`, a syntax error, a CSV without the named columns, a corrupted canvas payload |
 | `tests/test_dynamax_backend.py` | the second filter implementation agrees with the first (skipped when dynamax is not installed) |

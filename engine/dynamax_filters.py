@@ -174,6 +174,10 @@ def _model_fns(engine, sensors, mode='auto'):
     sidx = np.array([i for i, m in enumerate(names) if m in sel], dtype=int)
     p_full = len(names)
     jidx = jnp.asarray(sidx)
+    # the NumPy twin the JAX h is checked against
+    h_ref = engine._sensor_subset(sensors, np.zeros((1, p_full)),
+                                  np.eye(p_full))[0]
+    p_out = len(sidx)
 
     def _rk4(f):
         def step(x, u):
@@ -204,8 +208,8 @@ def _model_fns(engine, sensors, mode='auto'):
                                  dtype=float)
                 gh = np.asarray(h_jit(jnp.asarray(xk), jnp.asarray(uk)),
                                 dtype=float)
-                wh = np.asarray(s.h(xk, uk), dtype=float)[sidx]
-                ok = ok and (got.shape == (n,) and gh.shape == sidx.shape
+                wh = np.asarray(h_ref(xk, uk), dtype=float)
+                ok = ok and (got.shape == (n,) and gh.shape == (p_out,)
                              and np.allclose(got, np_step(xk, uk),
                                              rtol=1e-9, atol=1e-12)
                              and np.allclose(gh, wh, rtol=1e-9, atol=1e-12))
@@ -242,7 +246,7 @@ def _wrap_to(y, raw, mask):
 
 
 def _problem(engine, q_diag, r_diag, seed, u_noise_var, u_bias, p0_diag,
-             x0_guess, sensors, q_noise, mode, wrap_angles=True):
+             x0_guess, sensors, q_noise, mode):
     """ One estimation problem, assembled exactly as the engine's own filters
     assemble it, with the model functions handed over to JAX. """
     _require()
@@ -257,7 +261,7 @@ def _problem(engine, q_diag, r_diag, seed, u_noise_var, u_bias, p0_diag,
     f_core, h_core, _sidx, used = _model_fns(engine, sensors, mode)
     n_u = U.shape[1]
 
-    if ang and wrap_angles:
+    if ang:      # wrap the angular channels; see _wrap_to
         # Augment the input with that step's measurement so h can wrap against
         # it (see _wrap_to). dynamax hands u_t to both f and h at step t, so
         # this is the one channel available for it; f simply ignores the tail.
@@ -278,25 +282,43 @@ def _problem(engine, q_diag, r_diag, seed, u_noise_var, u_bias, p0_diag,
         Qds = np.diag([q_diag[nm] for nm in s.state_names])
     return dict(Y=jnp.asarray(Y), U=jnp.asarray(inputs), Q=jnp.asarray(Qds),
                 R=jnp.asarray(R), x0=jnp.asarray(xh0), P0=jnp.asarray(P0),
-                f=f_step, h=h_sel, mode=used, wrapped=bool(ang and wrap_angles))
+                f=f_step, h=h_sel, mode=used, wrapped=bool(ang))
 
 
-def _unpack(post):
+def _unpack(post, ang_s=()):
     """ dynamax posterior → the engine's (X_hat, P_diag) contract: post-update
-    means and the diagonal of the post-update covariance, one row per step. """
-    X_hat = np.asarray(post.filtered_means, dtype=float)
+    means and the diagonal of the post-update covariance, one row per step.
+
+    dynamax has no notion of a circular state, so it lets an angular state drift
+    in whatever 2π branch it started in. `ang_s` names the angular-state columns
+    (spec.angle_states); they are canonicalized back into (−π, π] here with the
+    SAME wrap the engine's filters apply after each update, so the reported
+    estimate lands in the engine's branch instead of one an integer number of
+    turns away. This is representation only — variance is branch-invariant, so P
+    is untouched — and it is the one lever dynamax exposes: its UKF takes plain
+    sigma-point means with no hook for a circular mean (see `limitations`). """
+    X_hat = np.array(post.filtered_means, dtype=float)   # copy: JAX out is read-only
+    if len(ang_s):
+        a = list(ang_s)
+        X_hat[:, a] = (X_hat[:, a] + np.pi) % (2.0 * np.pi) - np.pi
     P = np.asarray(post.filtered_covariances, dtype=float)
     return X_hat, np.diagonal(P, axis1=1, axis2=2).copy()
+
+
+def _angular_state_idx(spec):
+    """ Column indices of spec.angle_states within the state vector. """
+    return [i for i, nm in enumerate(spec.state_names)
+            if nm in getattr(spec, 'angle_states', ())]
 
 
 def run_ekf(engine, q_diag, r_diag, seed=0, u_noise_var=0.0, u_bias=None,
             p0_diag=None, x0_guess=None, sensors=None,
             q_noise='uncorrelated', num_iter=1, mode='auto',
-            wrap_angles=True, **_ignored):
+            **_ignored):
     """ dynamax's extended Kalman filter on the engine's estimation problem.
     Returns (X_hat, P_diag), post-update, matching ObservabilityEngine.run_ekf.
 
-    Angular innovations are wrapped by construction (`wrap_angles`, see
+    Angular innovations are wrapped by construction (see
     `_wrap_to`); pass False to see what an unwrapped filter does to a model with
     arctan2 channels. What remains different from the reference EKF: the
     Jacobians are exact (autodiff) instead of finite differences unless the
@@ -308,20 +330,20 @@ def run_ekf(engine, q_diag, r_diag, seed=0, u_noise_var=0.0, u_bias=None,
     Extra keyword arguments the NumPy runners accept (full_cov, x0_scale, …) are
     ignored rather than rejected, so the two backends stay call-compatible. """
     P = _problem(engine, q_diag, r_diag, seed, u_noise_var, u_bias, p0_diag,
-                 x0_guess, sensors, q_noise, mode, wrap_angles)
+                 x0_guess, sensors, q_noise, mode)
     params = ParamsNLGSSM(
         initial_mean=P['x0'], initial_covariance=P['P0'],
         dynamics_function=P['f'], dynamics_covariance=P['Q'],
         emission_function=P['h'], emission_covariance=P['R'])
     post = extended_kalman_filter(params, P['Y'], inputs=P['U'],
                                   num_iter=max(1, int(num_iter)))
-    return _unpack(post)
+    return _unpack(post, _angular_state_idx(engine.spec))
 
 
 def run_ukf(engine, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
             u_noise_var=0.0, u_bias=None, p0_diag=None, x0_guess=None,
             sensors=None, q_noise='uncorrelated', mode='auto',
-            wrap_angles=True, **_ignored):
+            **_ignored):
     """ dynamax's unscented Kalman filter on the same problem. Returns
     (X_hat, P_diag), matching ObservabilityEngine.run_ukf.
 
@@ -329,7 +351,7 @@ def run_ukf(engine, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
     ±√(α²(n+κ))·σ, β the prior weight — dynamax builds the identical scaled
     unscented transform.
 
-    dynamax takes plain (non-circular) means and residuals, so `wrap_angles`
+    dynamax takes plain (non-circular) means and residuals, so the shift in
     (see `_wrap_to`) puts every sigma point's angular measurement in one branch
     around y_k — the same job the engine's circular sigma-point means do.
 
@@ -338,7 +360,7 @@ def run_ukf(engine, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
     with q_noise='vanloan' the step-0 covariance is used for every step, and the
     caller is told so via the returned note (see core.compute_payload). """
     P = _problem(engine, q_diag, r_diag, seed, u_noise_var, u_bias, p0_diag,
-                 x0_guess, sensors, q_noise, mode, wrap_angles)
+                 x0_guess, sensors, q_noise, mode)
     Q = P['Q']
     if Q.ndim == 3:                 # see the docstring: constant Q only
         Q = Q[0]
@@ -349,18 +371,19 @@ def run_ukf(engine, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
     hp = UKFHyperParams(alpha=float(alpha), beta=float(beta),
                         kappa=float(kappa))
     post = unscented_kalman_filter(params, P['Y'], hp, inputs=P['U'])
-    return _unpack(post)
+    return _unpack(post, _angular_state_idx(engine.spec))
 
 
-def limitations(spec, q_noise='uncorrelated', wrap_angles=True):
+def limitations(spec, q_noise='uncorrelated'):
     """ The caveats that apply to running THIS system through dynamax, as short
     phrases for the status line. Empty when there are none — which is the usual
     case now that angular channels are wrapped. """
     out = []
-    if getattr(spec, 'angle_measurements', ()) and not wrap_angles:
-        out.append('angular channels ('
-                   + ', '.join(spec.angle_measurements)
-                   + ') are NOT innovation-wrapped (wrap_angles=False)')
+    if getattr(spec, 'angle_states', ()):
+        out.append('angular states (' + ', '.join(spec.angle_states) +
+                   ') are wrapped to (−π, π] after filtering, not by a circular '
+                   'unscented mean — matches the engine unless a state’s spread '
+                   'straddles ±π')
     if q_noise == 'vanloan':
         out.append("dynamax's UKF takes a constant Q, so the Van Loan stack's "
                    'k=0 covariance is used at every step')

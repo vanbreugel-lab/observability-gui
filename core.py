@@ -71,7 +71,8 @@ _BASE_HZ = {name: float(round(1.0 / SYSTEMS[name]().dt)) for name in SYSTEMS}
 # dynamax (JAX). See engine/dynamax_filters.py for what is shared and what
 # necessarily differs. Availability is probed WITHOUT importing jax (seconds of
 # start-up), so a front-end can label the control before anything is computed.
-FILTER_BACKENDS = [('this repo (NumPy)', 'engine'), ('dynamax (JAX)', 'dynamax')]
+FILTER_BACKENDS = [('this repo (NumPy)', 'engine'), ('dynamax (JAX)', 'dynamax'),
+                   ('square-root UKF (NumPy)', 'srukf')]
 
 
 def _has_module(name):
@@ -178,7 +179,8 @@ def compute_payload(engine, job, p, est, on_stage=None):
     # anything unrecognized is the NumPy path: a stale browser session or a
     # script can post any string here, and reporting back a backend that did
     # not run would put a wrong line in the exported report
-    backend = 'dynamax' if p.get('backend') == 'dynamax' else 'engine'
+    req = p.get('backend')
+    backend = req if req in ('dynamax', 'srukf') else 'engine'
     dmx = None
     if backend == 'dynamax':
         try:
@@ -194,6 +196,9 @@ def compute_payload(engine, job, p, est, on_stage=None):
         caveats = dmx.limitations(spec, p.get('q_noise', 'uncorrelated'))
         note += (f'{" | " if note else ""}EKF/UKF via dynamax'
                  + (' — ' + '; '.join(caveats) if caveats else ''))
+    if backend == 'srukf':
+        note += (f'{" | " if note else ""}UKF via square-root UKF '
+                 '(Van der Merwe); EKF unchanged (NumPy)')
 
     results, meas = None, None
     tick('filt')
@@ -216,6 +221,14 @@ def compute_payload(engine, job, p, est, on_stage=None):
             filt_specs = [
                 ('EKF', functools.partial(dmx.run_ekf, engine), {}),
                 ('UKF', functools.partial(dmx.run_ukf, engine), ukf_kw)]
+        elif backend == 'srukf':
+            # only the UKF has a square-root form; the EKF slot stays the
+            # standard NumPy one, so toggling engine ↔ srukf is a clean A/B on
+            # the UKF alone (both plot into the same UKF series and cache under
+            # their own backend key)
+            filt_specs = [
+                ('EKF', engine.run_ekf, {}),
+                ('UKF', engine.run_srukf, ukf_kw)]
         else:
             filt_specs = [
                 ('EKF', engine.run_ekf, {}),

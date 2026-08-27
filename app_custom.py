@@ -3,7 +3,7 @@ Observability explorer — web edition.
 
 A Gradio front-end over the *identical* compute engine used by the PyQt desktop
 app (``observability_gui.ObservabilityEngine``): MPC trajectory → linearized
-Eq. (33) Gramian → pybounds empirical FIM → nonlinear Monte-Carlo Gramian →
+Eq. (33) Gramian → pybounds empirical FIM →
 EKF/UKF. The heavy numerics run in Python on the server; the browser only shows
 HTML/CSS widgets and the rendered matplotlib figures.
 
@@ -331,8 +331,9 @@ def _analysis_meta(spec, engine, system, dt_hz, p, disp, est, payload, status,
                for k in ('seed', 'unv', 'ub', 'x0', 'p0'))
     out.append(('estimators', [
         ('implementation',
-         'dynamax (JAX)' if payload.get('backend') == 'dynamax'
-         else 'this repo (NumPy)'),
+         {'dynamax': 'dynamax (JAX)',
+          'srukf': 'this repo (NumPy); UKF = square-root'}
+         .get(payload.get('backend'), 'this repo (NumPy)')),
         ('realization', 'shared — one set of values drove both filters' if same
          else 'independent per filter (UKF override on)'),
     ]))
@@ -1323,6 +1324,17 @@ _MEAS_GLOSS = {'phi': 'heading [rad]',
                'r_x': 'range/optic-flow x', 'r_y': 'range/optic-flow y',
                'beta': 'sideslip angle [rad]',
                'q_x': 'body-rate x', 'q_y': 'body-rate y', 'q_z': 'body-rate z'}
+_INPUT_GLOSS = {
+    'u_para': 'forward force command',
+    'u_perp': 'lateral force command',
+    'u_phi': 'roll / heading control',
+    'u_theta': 'pitch control',
+    'u_psi': 'yaw-rate control',
+    'u_thrust': 'thrust command',
+    'u_w': 'wind-speed rate command',
+    'u_zeta': 'wind-direction rate command',
+    'u_z': 'vertical acceleration (measured IMU input)',
+    'u_x': 'forward acceleration (measured IMU input)'}
 _STATE_GLOSS = {
     'x': 'x position [m]', 'y': 'y position [m]', 'z': 'altitude [m]',
     'v_para': 'parallel body velocity [m/s]',
@@ -1367,18 +1379,21 @@ SYS_LIST = [('fly', 'fly (full state)'), ('fly7', 'fly (simple)'),
 
 
 def _system_md(name):
-    """ Markdown reference for one built-in system: description + a state
-    definition table + inputs + measurements. """
+    """ Markdown reference for one built-in system: description + a definition
+    table each for its states, inputs and measurements (same three-column
+    layout, so the three read consistently). """
     s = SYSTEMS[name]()
-    st_rows = '\n'.join(
-        f"| `{x}` | {_STATE_GLOSS.get(x, '—')} |" for x in s.state_names)
-    meas = ', '.join(f'`{m}`' + (f' ({_MEAS_GLOSS[m]})' if m in _MEAS_GLOSS
-                                 else '') for m in s.measurement_names)
+
+    def _table(plural, singular, names, gloss):
+        rows = '\n'.join(f"| `{x}` | {gloss.get(x, '—')} |" for x in names)
+        return (f"**{plural}** ({len(names)}):\n\n"
+                f"| {singular} | definition |\n|---|---|\n{rows}\n\n")
+
     return (f"{_SYS_DESC[name]}\n\n"
-            f"**states** ({len(s.state_names)}):\n\n"
-            f"| state | definition |\n|---|---|\n{st_rows}\n\n"
-            f"- **inputs**: {', '.join(f'`{u}`' for u in s.input_names)}\n"
-            f"- **measurements**: {meas}\n")
+            + _table('states', 'state', s.state_names, _STATE_GLOSS)
+            + _table('inputs', 'input', s.input_names, _INPUT_GLOSS)
+            + _table('measurements', 'measurement', s.measurement_names,
+                     _MEAS_GLOSS))
 
 _S0 = get_spec('fly')      # defaults for the initial system, fly (full state)
 
@@ -1641,12 +1656,16 @@ with gr.Blocks(title=APP_TITLE) as demo:   # theme/js/css passed at launch (Grad
                 est_backend = gr.Radio(
                     choices=FILTER_BACKENDS, value='engine',
                     label='EKF / UKF implementation',
-                    info=('dynamax (probml/dynamax, JAX) runs the same problem '
-                          'through a JAX based EKF/UKF'
-                          if DYNAMAX_AVAILABLE else
-                          '**Warning: dynamax *** is not installed in your environment. '
-                          'Selecting it falls back to the standard NumPy filters. '
-                          'To use: pip install dynamax'))
+                    info=('square-root UKF (NumPy) swaps only the UKF for its '
+                          'Van der Merwe square-root form (EKF unchanged) — the '
+                          'same problem carried as a Cholesky factor, so it needs '
+                          'no PSD projection; compare it against the standard UKF. '
+                          + ('dynamax (probml/dynamax, JAX) runs the same problem '
+                             'through a JAX based EKF/UKF.'
+                             if DYNAMAX_AVAILABLE else
+                             '**dynamax is not installed** — selecting it falls '
+                             'back to the standard NumPy filters (pip install '
+                             'dynamax).')))
                 # The long-form version of the above lives in Reference &
                 # equations -> Estimators -> Implementation (EQ_BACKENDS), so
                 # this section stays short. Short version: same problem, same

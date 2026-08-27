@@ -33,6 +33,7 @@ import time
 import contextlib
 import numpy as np
 import pandas as pd
+from scipy.linalg import solve_triangular
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
@@ -159,6 +160,12 @@ def fly7_h(X, U):
 # the only measurement is forward ventral optic flow r_x = v_x / z. Altitude
 # is observable only during nonzero acceleration (paper Fig. 2c-v / Fig. 4b).
 
+# The paper's own state is {z, v_z, v_x} (authors' StateEstimator.m). The
+# forward position x is carried as the FIRST state so the trajectory panel can
+# plot the real (x, z) path (render uses the first two states as the horizontal
+# / vertical pair). x is unobservable from r_x and enters neither the filters'
+# corrections nor the Gramians of the paper's states — x_dot = v_x just
+# integrates the forward speed for display.
 ALT2D_STATES = ['x', 'z', 'v_z', 'v_x']
 ALT2D_INPUTS = ['u_z', 'u_x']
 ALT2D_MEAS = ['r_x']
@@ -172,10 +179,11 @@ def alt2d_f(X, U):
 
 def alt2d_h(X, U):
     x, z, v_z, v_x = X
-    # Paper Eq. 7 is r_x = -v_x/z, and the sign is not cosmetic for plotting:
-    # Fig. 4b shows forward optic flow running from about -2.5 to -0.7 s^-1.
-    # (It IS cosmetic for the filters and the Gramian -- flipping h flips both
-    # the innovation and C, and F = C^T R^-1 C is unchanged.)
+    # r_x = -v_x/z, the paper's convention (Cellini et al. Eq. 7; Fig. 4b shows
+    # forward optic flow running from about -2.5 to -0.7 s^-1). The sign is
+    # cosmetic for the filters and the Gramian -- flipping h flips both the
+    # innovation and C, and F = C^T R^-1 C is unchanged -- so only the plotted
+    # optic-flow trace changes.
     return [-v_x / z]
 
 
@@ -1193,7 +1201,8 @@ class ObservabilityEngine:
         `sensors` = None (or empty) keeps every channel, which is the previous
         behaviour, so callers that do not care are unaffected. Order follows
         `spec.measurement_names`, not the caller's list, so the same set always
-        produces the same problem. """
+        produces the same problem. 
+        """
         s = self.spec
         names = list(s.measurement_names)
         sel = set(sensors) if sensors else set(names)
@@ -1207,6 +1216,7 @@ class ObservabilityEngine:
                              'measurement channel')
         ang = [j for j, i in enumerate(sidx) if names[i] in s.angle_measurements]
         h_sel = lambda x, u: np.asarray(s.h(x, u), dtype=float)[sidx]
+
         return h_sel, Y[:, sidx], R[np.ix_(sidx, sidx)], ang
 
     def _ann_training_data(self, ann, n_traj, seed):
@@ -1270,13 +1280,39 @@ class ObservabilityEngine:
             self._ann_cache[key] = ann
         return self._ann_cache[key]
 
+    def attach_ann(self, ann, seed=0, n_traj=16, epochs=100, batch=256,
+                   noise_std=0.0):
+        """ Register an ALREADY-BUILT ANN estimator under the exact cache key
+        that ``_ann`` / ``run_aikf`` look up, so run_aikf uses THIS net instead
+        of training one. `ann` need only expose ``predict_series(Y, U)`` plus the
+        attributes ``target``, ``time_steps`` and ``layers``.
+
+        Returns the run_aikf keyword arguments that identify the net, so a caller
+        can never build a key that disagrees with the engine's own — the failure
+        mode of poking ``_ann_cache`` with a hand-copied tuple, where a drift on
+        either side silently falls through to an 11-minute training run:
+
+            kw = engine.attach_ann(net, seed=SEED)
+            engine.run_aikf(net.target, q, r, seed=SEED, **kw, ...)
+
+        ``n_traj``/``epochs``/``batch``/``noise_std`` never trigger training here;
+        they only KEY the cache, and returning them is what keeps both sides in
+        step. Attach under the same ``seed`` you will pass to run_aikf. """
+        key = (self.spec.name, ann.target, int(ann.time_steps),
+               tuple(ann.layers), int(n_traj), int(epochs), int(batch),
+               round(float(noise_std), 6), int(seed))
+        self._ann_cache[key] = ann
+        return dict(time_steps=int(ann.time_steps), layers=tuple(ann.layers),
+                    n_traj=int(n_traj), epochs=int(epochs), batch=int(batch),
+                    noise_std=float(noise_std))
+
     def run_aikf(self, target, q_diag, r_diag, seed=0, time_steps=4,
                  layers=(64, 64, 64), n_traj=16, epochs=100, batch=256,
                  noise_std=0.01, motif_input=None, motif_window=20,
                  motif_upper=0.5, R_ann_lo=1e-3, R_ann_hi=1e12,
                  alpha=1e-3, beta=1.0, kappa=0.0,
                  x0_scale=1.0, x0_offset=None, u_noise_var=0.0, u_bias=None,
-                 p0_diag=None, x0_guess=None):
+                 p0_diag=None, x0_guess=None, sensors=None, start_at='prior'):
         """ The repo's AI-KF (util/StateEstimator.m): a UKF on the real dynamics
         whose measurement vector is AUGMENTED with the ANN's estimate of `target`
         as a pseudo-measurement, and whose noise entry for that channel is
@@ -1312,11 +1348,17 @@ class ObservabilityEngine:
               if motif_input in s.input_names else len(s.input_names) - 1)
         R_ann = motif_R(np.abs(U[:, mi]), motif_window, motif_upper,
                         (float(R_ann_hi), float(R_ann_lo)))
-        # augmented measurement: [real sensors..., ANN estimate of `target`]
-        p_real = len(s.measurement_names)
-        ang_m = [i for i, m in enumerate(s.measurement_names)
-                 if m in s.angle_measurements]
+        # augmented measurement: [real sensors..., ANN estimate of `target`].
+        # `sensors` restricts the REAL channels exactly as in run_ekf/run_ukf, so
+        # the AI-KF can be driven by the same subset the observability analysis
+        # uses; the ANN pseudo-measurement is appended after them.
+        h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
+        p_real = Y.shape[1]
         circ = target in s.angle_states
+        # angular STATES need the same circular treatment run_ukf gives
+        # them — this is a UKF too, and h() wraps them through atan2
+        ang_s = [i for i, nm in enumerate(s.state_names)
+                 if nm in getattr(s, 'angle_states', ())]
         ang_aug = ang_m + ([p_real] if circ else [])   # angular cols of the
         wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi   # augmented vector
         Qd = np.diag([q_diag[k] for k in s.state_names])
@@ -1342,6 +1384,29 @@ class ObservabilityEngine:
             pts[n + 1:] = x - L.T
             return pts
 
+        def psd_local(M):
+            """ As run_ukf's psd(): the wrapped-residual update can leave the
+            PSD cone, and the next Cholesky would fail. """
+            M = (M + M.T) / 2
+            if not np.all(np.isfinite(M)):
+                raise np.linalg.LinAlgError('AI-KF diverged: covariance is '
+                                            'not finite')
+            e, V = np.linalg.eigh(M)
+            return (V * np.clip(e, 0.0, None)) @ V.T
+
+        def circ_mean(A, W, idx):
+            m = A.T @ W
+            for i in idx:
+                m[i] = np.arctan2(np.sum(W * np.sin(A[:, i])),
+                                  np.sum(W * np.cos(A[:, i])))
+            return m
+
+        def resid(A, m, idx):
+            D = A - m
+            if idx:
+                D[:, idx] = wrap(D[:, idx])
+            return D
+
         def y_stats(Ys, cols):
             ym = Ys.T @ Wm
             for i in cols:               # circular mean for angular channels
@@ -1356,41 +1421,44 @@ class ObservabilityEngine:
         P_diag = np.zeros((self.N, n))
         for k in range(self.N):
             # ── measurement update over the augmented vector ────────────────
-            use_ann = bool(np.isfinite(raw[k]))
-            pts = sigma_points(xh, P)
-            Ys = np.array([np.asarray(s.h(pt, U[k]), dtype=float) for pt in pts])
-            if use_ann:
-                # the ANN channel observes the target state directly, so its
-                # sigma-point image is just that component
-                Ys = np.hstack([Ys, pts[:, [j_t]]])
-                Rk = np.zeros((p_real + 1, p_real + 1))
-                Rk[:p_real, :p_real] = R
-                Rk[-1, -1] = R_ann[k]
-                zk = np.append(Y[k], raw[k])
-                cols = ang_aug
-            else:
-                Rk, zk, cols = R, Y[k], ang_m
-            ym, dY = y_stats(Ys, cols)
-            dX = pts - xh
-            S_cov = dY.T @ (Wc[:, None] * dY) + Rk
-            Cxy = dX.T @ (Wc[:, None] * dY)
-            K = np.linalg.solve(S_cov.T, Cxy.T).T
-            innov = zk - ym
-            if cols:
-                innov[cols] = wrap(innov[cols])
-            xh = xh + K @ innov
-            P = P - K @ S_cov @ K.T
-            P = (P + P.T) / 2
+            # skipped at k=0 under 'posterior', where the supplied estimate is
+            # x̂₀|₀ (already corrected), not the prior
+            if not (k == 0 and start_at == 'posterior'):
+                use_ann = bool(np.isfinite(raw[k]))
+                pts = sigma_points(xh, P)
+                Ys = np.array([h_sel(pt, U[k]) for pt in pts])
+                if use_ann:
+                    # the ANN channel observes the target state directly, so its
+                    # sigma-point image is just that component
+                    Ys = np.hstack([Ys, pts[:, [j_t]]])
+                    Rk = np.zeros((p_real + 1, p_real + 1))
+                    Rk[:p_real, :p_real] = R
+                    Rk[-1, -1] = R_ann[k]
+                    zk = np.append(Y[k], raw[k])
+                    cols = ang_aug
+                else:
+                    Rk, zk, cols = R, Y[k], ang_m
+                ym, dY = y_stats(Ys, cols)
+                dX = resid(pts, xh, ang_s)
+                S_cov = dY.T @ (Wc[:, None] * dY) + Rk
+                Cxy = dX.T @ (Wc[:, None] * dY)
+                K = np.linalg.solve(S_cov.T, Cxy.T).T
+                innov = zk - ym
+                if cols:
+                    innov[cols] = wrap(innov[cols])
+                xh = xh + K @ innov
+                if ang_s:
+                    xh[ang_s] = wrap(xh[ang_s])
+                P = psd_local(P - K @ S_cov @ K.T)
             X_hat[k] = xh
             P_diag[k] = np.diag(P)
             # ── time update ─────────────────────────────────────────────────
             if k < self.N - 1:
                 pts = sigma_points(xh, P)
                 Xs = np.array([sim._rk4_step(pt, U[k]) for pt in pts])
-                xh = Xs.T @ Wm
-                dXp = Xs - xh
-                P = dXp.T @ (Wc[:, None] * dXp) + Qd
-                P = (P + P.T) / 2
+                xh = circ_mean(Xs, Wm, ang_s)
+                dXp = resid(Xs, xh, ang_s)
+                P = psd_local(dXp.T @ (Wc[:, None] * dXp) + Qd)
         return X_hat, P_diag, raw, R_ann
 
     def run_ann_mif(self, target, q_diag, r_diag, lam, seed=0, time_steps=4,
@@ -1446,14 +1514,26 @@ class ObservabilityEngine:
 
     def run_ekf(self, q_diag, r_diag, seed=0, full_cov=False,
                 x0_scale=1.0, x0_offset=None, u_noise_var=0.0, u_bias=None, p0_diag=None,
-                x0_guess=None, f_jac_at='post', fd_eps_scaled=False,
-                q_noise='uncorrelated', sensors=None):
+                x0_guess=None, f_jac_at='pre', fd_eps_scaled=False,
+                q_noise='uncorrelated', sensors=None, start_at='prior'):
         """ EKF along the true trajectory (finite-difference Jacobians of the
         RK4 step and of h). Returns (X_hat, P_diag), post-update values;
 
         `sensors` restricts the filter to a subset of the measurement channels —
         pass the same selection the observability analysis uses so the estimator
         and the Gramians answer the same question. None means every channel.
+
+        `start_at` sets the indexing convention for the supplied initial estimate
+        (`x0_guess` / `p0_diag` set its value and covariance either way):
+          'prior'     (default) the estimate is the PRIOR x̂₀|₋₁, so the cycle is
+                      entered at the k=0 CORRECTION and y₀ is consumed; X_hat[0]
+                      is already one update in. This aligns the filter with the
+                      constructability Gramian, whose recursion starts the same
+                      way (F₀ = C₀ᵀR⁻¹C₀).
+          'posterior' the estimate IS x̂₀|₀; the k=0 correction is SKIPPED, y₀ is
+                      never consumed, and X_hat[0] is the supplied guess verbatim
+                      (Kalman's original indexing; Bar-Shalom, Gelb, Simon).
+                      Identical from k=1 on given the same information.
 
         Aligned with the BOUNDS reference EKF (util/extended_kalman_filter.py::EKF):
         `f_jac_at='post'` linearizes F about the PROPAGATED state as the reference
@@ -1479,6 +1559,17 @@ class ObservabilityEngine:
         Qds = (self._lin(q_diag, q_noise)[2] if q_noise == 'vanloan' else
                [np.diag([q_diag[nm] for nm in s.state_names])] * self.N)
         h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
+        # ANGULAR STATES ARE KEPT CANONICAL. zeta is a wind direction and phi a
+        # heading: only (-pi, pi] are legal values, so they are re-wrapped after
+        # each update, exactly as run_ukf does. Without this the EKF's state
+        # drifts outside the range it is defined on (measured: zeta_hat reaching
+        # -3.196 against a truth of -pi) and anything downstream -- a plot, a
+        # table, a comparison against another estimator -- reports an angle that
+        # cannot exist. It is numerically NEUTRAL: f and h depend on these states
+        # only through cos/sin, so every quantity in the recursion is periodic in
+        # them (verified to 1e-15).
+        ang_s = [i for i, nm in enumerate(s.state_names)
+                 if nm in getattr(s, 'angle_states', ())]
         wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
 
         def jac(func, x, u, eps=1e-6):
@@ -1496,16 +1587,20 @@ class ObservabilityEngine:
         P_hist = []
         I_n = np.eye(n)
         for k in range(self.N):
-            # measurement update
-            C = jac(h_sel, xh, U[k])
-            innov = Y[k] - h_sel(xh, U[k])
-            if ang_m:
-                innov[ang_m] = wrap(innov[ang_m])
-            S = C @ P @ C.T + R
-            K = np.linalg.solve(S.T, (P @ C.T).T).T
-            xh = xh + K @ innov
-            IKC = I_n - K @ C
-            P = IKC @ P @ IKC.T + K @ R @ K.T   # Joseph form
+            # measurement update — skipped at k=0 under 'posterior', where the
+            # supplied estimate is x̂₀|₀ (already corrected), not the prior
+            if not (k == 0 and start_at == 'posterior'):
+                C = jac(h_sel, xh, U[k])
+                innov = Y[k] - h_sel(xh, U[k])
+                if ang_m:
+                    innov[ang_m] = wrap(innov[ang_m])
+                S = C @ P @ C.T + R
+                K = np.linalg.solve(S.T, (P @ C.T).T).T
+                xh = xh + K @ innov
+                if ang_s:
+                    xh[ang_s] = wrap(xh[ang_s])
+                IKC = I_n - K @ C
+                P = IKC @ P @ IKC.T + K @ R @ K.T   # Joseph form
             X_hat[k] = xh
             P_diag[k] = np.diag(P)
             if full_cov:
@@ -1524,7 +1619,8 @@ class ObservabilityEngine:
     def run_ukf(self, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
                 full_cov=False, x0_scale=1.0, x0_offset=None, u_noise_var=0.0,
                 u_bias=None, p0_diag=None, x0_guess=None,
-                q_noise='uncorrelated', sensors=None):
+                q_noise='uncorrelated', sensors=None,
+                wrap_states=True, start_at='prior'):
         """ UKF on the identical problem realization as run_ekf (same seed →
         same measurements and initial estimate). Merwe scaled unscented
         transform with tunable spread α, prior β, secondary scaling κ (defaults
@@ -1532,7 +1628,20 @@ class ObservabilityEngine:
         residuals for the arctan2 measurements.
 
         `sensors` restricts the filter to a subset of the measurement channels,
-        exactly as in run_ekf; None means every channel. """
+        exactly as in run_ekf; None means every channel.
+
+
+
+        `wrap_states` gives spec.angle_states a CIRCULAR mean and wrapped
+        residuals inside the unscented transform, and re-wraps them after each
+        update. DEFAULT True — the standard treatment (Kraft 2003; Crassidis &
+        Markley 2003; FilterPy exposes x_mean_fn / residual_x for exactly this),
+        not an optional extra. h() wraps the angular states implicitly through
+        atan2, so without it the measurement deviations come back wrapped while
+        the state deviations do not, the cross-covariance mixes the two, and the
+        gain is wrong once the sigma points span a real fraction of a circle.
+        Measured on the fly: harmless at a spread of 1.70 rad (UKF rms 0.041),
+        failing outright at 4.45 rad (rms 2.008), while the EKF is untouched. """
         s = self.spec
         n = len(s.state_names)
         sim = self._rk4_sim()
@@ -1549,6 +1658,9 @@ class ObservabilityEngine:
         Qds = (self._lin(q_diag, q_noise)[2] if q_noise == 'vanloan' else
                [np.diag([q_diag[nm] for nm in s.state_names])] * self.N)
         h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
+        ang_s = ([i for i, nm in enumerate(s.state_names)
+                  if nm in getattr(s, 'angle_states', ())]
+                 if wrap_states else [])
         wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
 
         lam_s = alpha ** 2 * (n + kappa) - n     # Merwe scaling parameter
@@ -1563,6 +1675,25 @@ class ObservabilityEngine:
                 e, V = np.linalg.eigh((M + M.T) / 2)
                 return V @ np.diag(np.sqrt(np.clip(e, 1e-15, None)))
 
+        def psd(M):
+            """ Symmetrize and project onto the PSD cone.
+
+            Not a tuning knob: the UKF measurement update below is
+            P - K S K^T, the NON-Joseph form, and with wrapped angular
+            residuals the S it subtracts is no longer exactly consistent with P,
+            so the result can leave the PSD cone. The next step then asks for a
+            Cholesky of it. Projecting back is the numerical companion to the
+            circular treatment -- the two were introduced together and removing
+            either alone makes the fly diverge on the app's own default
+            settings. The principled alternative is Van der Merwe's square-root
+            UKF, which keeps the factor PSD by construction. """
+            M = (M + M.T) / 2
+            if not np.all(np.isfinite(M)):
+                raise np.linalg.LinAlgError('filter diverged: covariance is '
+                                            'not finite')
+            e, V = np.linalg.eigh(M)
+            return (V * np.clip(e, 0.0, None)) @ V.T
+
         def sigma_points(x, P):
             L = sqrt_psd(scale * P)
             pts = np.empty((2 * n + 1, n))
@@ -1570,6 +1701,30 @@ class ObservabilityEngine:
             pts[1:n + 1] = x + L.T
             pts[n + 1:] = x - L.T
             return pts
+
+        def circ_mean(A, W, idx):
+            """ Weighted mean of rows of A, circular on the columns in `idx`.
+            The columns in `idx` are angular STATES (spec.angle_states): the
+            plain weighted mean of angles straddling ±π is meaningless, so
+            those columns take atan2(Σ W sin, Σ W cos) instead. This is the
+            change that makes the UKF track a wind direction / heading correctly
+            once its sigma points span a real fraction of a circle — averaging
+            them linearly is what let the filter lose to the EKF (Kraft 2003;
+            Crassidis & Markley 2003). Called on the propagated sigma points in
+            the time update below with idx = ang_s; the non-angular columns fall
+            through to the plain weighted mean. (The angular MEASUREMENT channels
+            get the same treatment separately, inline in y_stats.) """
+            m = A.T @ W
+            for i in idx:
+                m[i] = np.arctan2(np.sum(W * np.sin(A[:, i])),
+                                  np.sum(W * np.cos(A[:, i])))
+            return m
+
+        def resid(A, m, idx):
+            D = A - m
+            if idx:
+                D[:, idx] = wrap(D[:, idx])
+            return D
 
         def y_stats(Ys):
             ym = Ys.T @ Wm
@@ -1585,20 +1740,26 @@ class ObservabilityEngine:
         P_diag = np.zeros((self.N, n))
         P_hist = []
         for k in range(self.N):
-            # measurement update
-            pts = sigma_points(xh, P)
-            Ys = np.array([h_sel(pt, U[k]) for pt in pts])
-            ym, dY = y_stats(Ys)
-            dX = pts - xh
-            S_cov = dY.T @ (Wc[:, None] * dY) + R
-            Cxy = dX.T @ (Wc[:, None] * dY)
-            K = np.linalg.solve(S_cov.T, Cxy.T).T
-            innov = Y[k] - ym
-            if ang_m:
-                innov[ang_m] = wrap(innov[ang_m])
-            xh = xh + K @ innov
-            P = P - K @ S_cov @ K.T
-            P = (P + P.T) / 2
+            # measurement update — skipped at k=0 under 'posterior', where the
+            # supplied estimate is x̂₀|₀ (already corrected), not the prior
+            if not (k == 0 and start_at == 'posterior'):
+                pts = sigma_points(xh, P)
+                Ys = np.array([h_sel(pt, U[k]) for pt in pts])
+                ym, dY = y_stats(Ys)
+                dX = resid(pts, xh, ang_s)
+                S_cov = dY.T @ (Wc[:, None] * dY) + R
+                Cxy = dX.T @ (Wc[:, None] * dY)
+                try:
+                    K = np.linalg.solve(S_cov.T, Cxy.T).T
+                except np.linalg.LinAlgError:  # singular innovation covariance
+                    K = (np.linalg.pinv(S_cov.T) @ Cxy.T).T
+                innov = Y[k] - ym
+                if ang_m:
+                    innov[ang_m] = wrap(innov[ang_m])
+                xh = xh + K @ innov
+                if ang_s:
+                    xh[ang_s] = wrap(xh[ang_s])
+                P = psd(P - K @ S_cov @ K.T)
             X_hat[k] = xh
             P_diag[k] = np.diag(P)
             if full_cov:
@@ -1607,10 +1768,147 @@ class ObservabilityEngine:
             if k < self.N - 1:
                 pts = sigma_points(xh, P)
                 Xs = np.array([sim._rk4_step(pt, U[k]) for pt in pts])
-                xh = Xs.T @ Wm
-                dXp = Xs - xh
-                P = dXp.T @ (Wc[:, None] * dXp) + Qds[k]
-                P = (P + P.T) / 2
+                xh = circ_mean(Xs, Wm, ang_s)
+                dXp = resid(Xs, xh, ang_s)
+                P = psd(dXp.T @ (Wc[:, None] * dXp) + Qds[k])
+        if full_cov:
+            return X_hat, P_diag, P_hist
+        return X_hat, P_diag
+
+    def run_srukf(self, q_diag, r_diag, seed=0, alpha=1.0, beta=2.0, kappa=0.0,
+                  full_cov=False, x0_scale=1.0, x0_offset=None, u_noise_var=0.0,
+                  u_bias=None, p0_diag=None, x0_guess=None,
+                  q_noise='uncorrelated', sensors=None,
+                  wrap_states=True, start_at='prior'):
+        """ Square-root UKF (Van der Merwe & Wan 2001) on the IDENTICAL problem
+        realization as run_ukf — same seed → same measurements and initial
+        estimate — so the two are directly comparable.
+
+        Same scaled unscented transform, weights, sensor subset, per-step Q and
+        circular treatment as run_ukf. The ONE difference is numerical: the
+        covariance is carried as its lower-triangular Cholesky factor S
+        (P = S Sᵀ) and propagated with a QR factorization plus rank-1 Cholesky
+        up/downdates, never formed explicitly. The factor is a valid square root
+        by construction, so this needs none of run_ukf's psd() projection or the
+        eigendecomposition Cholesky fallback — which is the reason to have it.
+        Any place run_ukf leans on those, the two estimates will part company,
+        and that gap is exactly what comparing them shows. """
+        s = self.spec
+        n = len(s.state_names)
+        sim = self._rk4_sim()
+        Y, xh, P, R, U = self._estimation_problem(r_diag, seed, x0_scale,
+                                                  x0_offset, u_noise_var,
+                                                  u_bias, p0_diag, x0_guess)
+        # same per-step process covariance stack as run_ekf/run_ukf
+        Qds = (self._lin(q_diag, q_noise)[2] if q_noise == 'vanloan' else
+               [np.diag([q_diag[nm] for nm in s.state_names])] * self.N)
+        h_sel, Y, R, ang_m = self._sensor_subset(sensors, Y, R)
+        ang_s = ([i for i, nm in enumerate(s.state_names)
+                  if nm in getattr(s, 'angle_states', ())]
+                 if wrap_states else [])
+        wrap = lambda a: (a + np.pi) % (2 * np.pi) - np.pi
+
+        lam_s = alpha ** 2 * (n + kappa) - n     # Merwe scaling parameter
+        scale = max(n + lam_s, 1e-6)             # = α²(n+κ)
+        gamma = np.sqrt(scale)                   # sigma spread √scale
+        Wm = np.full(2 * n + 1, 1.0 / (2 * scale)); Wm[0] = lam_s / scale
+        Wc = Wm.copy(); Wc[0] = lam_s / scale + (1.0 - alpha ** 2 + beta)
+        sqrtWc = np.sqrt(Wc[1:])                 # ≥ 0: the 2n symmetric points
+        Rc = np.linalg.cholesky(R)               # lower factor of the meas noise
+
+        def cholupdate(L, x, sign):
+            """ Rank-1 update of a lower-triangular Cholesky factor: return L'
+            with L' L'ᵀ = L Lᵀ + sign·x xᵀ (sign = +1 update, −1 downdate).
+            Works for any dimension; operates on copies. """
+            L = np.array(L, dtype=float); x = np.array(x, dtype=float)
+            for k in range(x.size):
+                r = np.sqrt(max(L[k, k] ** 2 + sign * x[k] ** 2, 0.0))
+                c = r / L[k, k]; sk = x[k] / L[k, k]
+                L[k, k] = r
+                if k + 1 < x.size:
+                    L[k + 1:, k] = (L[k + 1:, k] + sign * sk * x[k + 1:]) / c
+                    x[k + 1:] = c * x[k + 1:] - sk * L[k + 1:, k]
+            return L
+
+        def sqrt_from(dev, noise_c):
+            """ Lower Cholesky factor of Σ_{i≥1} Wc_i dev_i dev_iᵀ + noise_c
+            noise_cᵀ, then a rank-1 up/downdate with the i=0 sigma deviation.
+            `dev` is (2n+1)×d with row 0 the centre point. The 2n symmetric
+            weights Wc[1:] are positive so they go through the (stable) QR; only
+            Wc[0] can be negative, which the cholupdate carries as its sign. """
+            A = np.vstack([sqrtWc[:, None] * dev[1:], noise_c.T])
+            Rq = np.linalg.qr(A, mode='r')       # A = Q Rq ⇒ AᵀA = Rqᵀ Rq
+            Rq = Rq * np.sign(np.diag(Rq))[:, None]   # positive diagonal
+            return cholupdate(Rq.T, np.sqrt(abs(Wc[0])) * dev[0], np.sign(Wc[0]))
+
+        def sigma_points(x, S):
+            W = gamma * S                        # columns of S scaled by √scale
+            pts = np.empty((2 * n + 1, n))
+            pts[0] = x
+            pts[1:n + 1] = x + W.T
+            pts[n + 1:] = x - W.T
+            return pts
+
+        def circ_mean(A, W, idx):
+            m = A.T @ W
+            for i in idx:
+                m[i] = np.arctan2(np.sum(W * np.sin(A[:, i])),
+                                  np.sum(W * np.cos(A[:, i])))
+            return m
+
+        def resid(A, m, idx):
+            D = A - m
+            if idx:
+                D[:, idx] = wrap(D[:, idx])
+            return D
+
+        def y_stats(Ys):
+            ym = Ys.T @ Wm
+            for i in ang_m:                      # circular mean, angular channels
+                ym[i] = np.arctan2(np.sum(Wm * np.sin(Ys[:, i])),
+                                   np.sum(Wm * np.cos(Ys[:, i])))
+            dY = Ys - ym
+            if ang_m:
+                dY[:, ang_m] = wrap(dY[:, ang_m])
+            return ym, dY
+
+        X_hat = np.zeros_like(self.X)
+        P_diag = np.zeros((self.N, n))
+        P_hist = []
+        S = np.linalg.cholesky(P)                # carry the factor, not P
+        for k in range(self.N):
+            # measurement update — skipped at k=0 under 'posterior' (see run_ekf)
+            if not (k == 0 and start_at == 'posterior'):
+                pts = sigma_points(xh, S)
+                Ys = np.array([h_sel(pt, U[k]) for pt in pts])
+                ym, dY = y_stats(Ys)
+                dX = resid(pts, xh, ang_s)
+                Sy = sqrt_from(dY, Rc)           # innovation factor, S_y S_yᵀ = P_yy
+                Cxy = dX.T @ (Wc[:, None] * dY)
+                # K = C_xy (S_y S_yᵀ)⁻¹ via two triangular solves, no inverse
+                K = solve_triangular(
+                    Sy.T, solve_triangular(Sy, Cxy.T, lower=True),
+                    lower=False).T
+                innov = Y[k] - ym
+                if ang_m:
+                    innov[ang_m] = wrap(innov[ang_m])
+                xh = xh + K @ innov
+                if ang_s:
+                    xh[ang_s] = wrap(xh[ang_s])
+                Umat = K @ Sy                    # downdate S by each column of K S_y
+                for j in range(Umat.shape[1]):
+                    S = cholupdate(S, Umat[:, j], -1.0)
+            X_hat[k] = xh
+            P_diag[k] = (S * S).sum(axis=1)      # diag(S Sᵀ)
+            if full_cov:
+                P_hist.append(S @ S.T)
+            # time update
+            if k < self.N - 1:
+                pts = sigma_points(xh, S)
+                Xs = np.array([sim._rk4_step(pt, U[k]) for pt in pts])
+                xh = circ_mean(Xs, Wm, ang_s)
+                dXp = resid(Xs, xh, ang_s)
+                S = sqrt_from(dXp, np.linalg.cholesky(Qds[k]))
         if full_cov:
             return X_hat, P_diag, P_hist
         return X_hat, P_diag
