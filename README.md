@@ -102,7 +102,6 @@ python -m pytest -m "not slow"    # skip the full-trajectory solves, ~40 s
 python smoke_test.py              # the end-to-end script, incl. front-end parity
 ```
 
-The suite is organised by what it protects, rather than by module:
 
 | file | what it pins |
 |---|---|
@@ -115,23 +114,14 @@ The suite is organised by what it protects, rather than by module:
 | `tests/test_dynamax_backend.py` | the second filter implementation agrees with the first (skipped when dynamax is not installed) |
 | `tests/test_render_and_export.py` | every figure actually *draws* (matplotlib defers its work to render time), and the PDF export writes a real PDF |
 
-Two conventions worth knowing if you add to it:
-
-* **Callbacks may not raise.** A Gradio callback that throws shows the user a red
-  box with no explanation. At that layer the requirement is a returned status
-  string starting with ⚠ — so the tests are mostly "give it something wrong,
-  assert it comes back with a message".
-* **Engines are expensive and shared.** `conftest.py` solves each system once, on
-  a short hand-made set-point, and hands the same engine to every test. Ask for
-  the `fresh_engine` fixture if your test mutates one.
 
 ## Work in progress
 
-The **ANN** and **AI-KF** estimators are implemented but not yet validated —
+The **ANN** and **AI-KF** estimators are coded but currently off and not yet validated —
 their accuracy depends heavily on how the training trajectories are generated.
 Their controls are greyed out in the app and their compute path is disabled;
 the equations and defaults are still shown for reference. To re-enable them for
-development, set `ANN_ENABLED = True` in `app_custom.py`.
+development, set `ANN_ENABLED = True` in `app_custom.py`. In the future, functionality may be built so that someone can load in a trained ANN.
 
 
 ## References

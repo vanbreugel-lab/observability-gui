@@ -42,3 +42,4 @@ output.png
 
 # gradio flag/cache dir
 .gradio/
+.claude/
