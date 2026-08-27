@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/opt/anaconda3/envs/Python311/bin/python -m pytest tests/test_dynamax_backend.py -q)",
-      "Bash(/opt/anaconda3/envs/Python311/bin/python -m pytest -q -m \"not slow\")",
-      "Bash(/opt/anaconda3/envs/Python311/bin/python -m pytest -q)"
-    ]
-  }
-}
